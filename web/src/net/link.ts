@@ -8,7 +8,7 @@ import type { Channel, Handshake } from '../wasm/yonder_wasm.js';
 import { bytesToB64 } from '../lib/base64';
 import { Emitter } from '../lib/emitter';
 import { OpenFailed, type RelayConnection } from './relay';
-import { defaultTimeout, RequestError, type ConnStatus, type HostConnection, type RequestOptions } from './types';
+import { defaultTimeout, FEATURE_SUBAGENTS, RequestError, type ConnStatus, type HostConnection, type RequestOptions } from './types';
 import { loadWasm } from './wasm';
 
 interface Pending {
@@ -199,7 +199,7 @@ export class HostLink implements HostConnection {
       });
       const hs = new w.Handshake(kp, this.host);
       this.handshake = hs;
-      const hello = { protocol: 1, device_name: name, client: 'web', ...(this.pairToken ? { pair_token: this.pairToken } : {}) };
+      const hello = { protocol: 1, device_name: name, client: 'web', features: [FEATURE_SUBAGENTS], ...(this.pairToken ? { pair_token: this.pairToken } : {}) };
       this.relay.send(link, hs.writeHello(JSON.stringify(hello)));
       this.handshakeTimer = setTimeout(() => {
         if (!this.channel) this.dropLink('timeout', true);

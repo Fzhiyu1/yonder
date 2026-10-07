@@ -281,7 +281,7 @@ impl PiState {
                 if let Some(it) = self.open.get_mut(&id) {
                     it.text.get_or_insert_with(String::new).push_str(&d);
                 }
-                out.event(AdapterEvent::Delta { item: id, field: DeltaField::Text, delta: d });
+                out.event(AdapterEvent::Delta { item: id, field: DeltaField::Text, delta: d, thread: None });
             }
             "text_end" | "thinking_end" => {
                 let Some(id) = self.blocks.remove(&idx) else { return };
@@ -353,6 +353,8 @@ impl PiState {
                     options,
                     item: None,
                     ts: now_ms(),
+                    thread: None,
+                    thread_name: None,
                 };
                 self.ui.insert(approval.id.clone(), UiRequest { method, choices });
                 out.event(AdapterEvent::ApprovalRequested(approval));

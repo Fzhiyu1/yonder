@@ -166,3 +166,19 @@ cd web && pnpm e2e webkit mobile   # needs `cargo build -p yonder-cli -p yonder-
 
 Deploy commands, host names and addresses are in the maintainer's private notes, not in this
 repository.
+
+## 2026-10-08: sub-agents (issue #6)
+
+- Codex `spawnAgent` and Claude Task / Agent calls show as one sub-agent card each (name,
+  role, model, task, live status, reply); tapping it opens the sub-agent's thread read-only
+  (`chat_thread`). Sub-agent approvals name the sub-agent and can be answered from the chat or
+  the thread view. Design: docs/adr/0006-subagents.md; wire behavior: client-protocol.md
+  section 5.
+- Measured with real runs: both agents already delivered sub-agent approvals to yonder; they
+  were unattributed, the sub-agent's work was invisible, and on Codex the sub-agent's turn end
+  marked the parent idle (fixed in PR #7, included here).
+- Mock mode has a finished Codex sub-agent (MacBook chat) and a running Claude sub-agent with a
+  pending approval (linux-box chat); the UX probe walks both, `pnpm e2e` has `chat-subagent`.
+- Not done: nested sub-agents get cards only inside their parent's thread view (no tree);
+  sub-agent threads older than the supervisor's cap (500 items, 32 threads) are not paged
+  from the log.

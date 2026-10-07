@@ -14,6 +14,8 @@ import type { StoredHost } from '../storage';
 import { b64ToBytes, bytesToB64, utf8Decode, utf8Encode } from '../lib/base64';
 import { Emitter } from '../lib/emitter';
 import { applyChatEvent, chatFromSnapshot, type ChatEvent, type ChatState } from '../store/chatReducer';
+import { applyThreadEvent, threadFromPage, type ThreadState } from '../lib/thread';
+import type { ChatItem } from '../proto/generated/ChatItem';
 import type { ConnectionProvider } from './manager';
 import {
   MOCK_AGENT_MD,
@@ -28,11 +30,14 @@ import {
   mockAgents,
   mockApproval,
   mockChatItems,
+  mockDeploySubagent,
+  mockSubagentThread,
+  MOCK_SUB_THREAD,
   mockPdf,
   mockPrompt,
   mockTerminalIntro,
 } from './mockData';
-import { RequestError, type ConnStatus, type HostConnection } from './types';
+import { FEATURE_SUBAGENTS, RequestError, type ConnStatus, type HostConnection } from './types';
 
 /** Items in the `attached` snapshot (the host sends the newest page only). */
 const MOCK_PAGE = 40;
@@ -104,6 +109,8 @@ class MockHost implements HostConnection {
   private reconnectedEm = new Emitter<void>();
   private sessions = new Map<string, SessionInfo>();
   private chats = new Map<string, ChatState>();
+  /** Sub-agent threads per chat (the chat state itself leaves their items out, like the host). */
+  private threads = new Map<string, Map<string, ThreadState>>();
   private terms = new Map<string, TermState>();
   private attached = new Set<string>();
   private files = new Map<string, MockFile>();
@@ -137,7 +144,7 @@ class MockHost implements HostConnection {
       vapid_public: 'BMock',
     };
     this.hostHello = online
-      ? { protocol: 1, ok: true, host_name: name, os, version: '0.1.0', permissions: ['sessions', 'files'] }
+      ? { protocol: 1, ok: true, host_name: name, os, version: '0.1.0', permissions: ['sessions', 'files'], features: [FEATURE_SUBAGENTS] }
       : undefined;
     this.devices = [
       { public: 'dWebThisDevice000000000000000000000000000000', name: '当前浏览器', client: 'web', paired_at: now() - 20 * 24 * HOUR, last_seen: now(), permissions: ['sessions', 'files'], current: true },
@@ -206,6 +213,16 @@ class MockHost implements HostConnection {
         if (!chat || end < 0) throw new RequestError('not_found', `item ${req.before}`);
         const start = Math.max(0, end - (req.limit ?? MOCK_PAGE));
         return { kind: 'chat_older', items: chat.order.slice(start, end).map((i) => chat.byId[i]), more: start > 0 };
+      }
+      case 'chat_thread': {
+        const chat = this.chats.get(req.session);
+        if (!chat) throw new RequestError('not_found', `session ${req.session}`);
+        const t = this.threads.get(req.session)?.get(req.thread);
+        if (!t) return { kind: 'chat_thread', items: [], more: false, seq: chat.seq };
+        const end = req.before ? t.order.indexOf(req.before) : t.order.length;
+        if (end < 0) return { kind: 'chat_thread', items: [], more: false, seq: chat.seq };
+        const start = Math.max(0, end - (req.limit ?? 200));
+        return { kind: 'chat_thread', items: t.order.slice(start, end).map((i) => t.byId[i]), more: start > 0, seq: chat.seq };
       }
       case 'detach':
         this.attached.delete(req.session);
@@ -507,6 +524,12 @@ class MockHost implements HostConnection {
     const ev = e.ev === 'chat_snapshot' ? e : ({ ...e, seq: c.seq + 1 } as ChatEvent);
     const { state } = applyChatEvent(c, ev);
     this.chats.set(session, state);
+    const thread = ev.ev === 'chat_item' ? ev.item.thread : ev.ev === 'chat_delta' ? ev.thread : undefined;
+    if (thread) {
+      const ts = this.threads.get(session) ?? new Map<string, ThreadState>();
+      this.threads.set(session, ts);
+      ts.set(thread, applyThreadEvent(ts.get(thread) ?? threadFromPage([], false, 0), ev, thread));
+    }
     if (this.attached.has(session)) this.emit(ev);
     const s = this.sessions.get(session);
     if (!s) return;
@@ -521,13 +544,59 @@ class MockHost implements HostConnection {
     this.chatEmit(session, { ev: 'chat_status', session, seq: 0, status });
   }
 
-  private streamText(session: string, itemId: string, field: 'text' | 'output', parts: string[], start: number, step: number): number {
+  private streamText(session: string, itemId: string, field: 'text' | 'output', parts: string[], start: number, step: number, thread?: string): number {
     let t = start;
     for (const p of parts) {
-      this.later(session, t, () => this.chatEmit(session, { ev: 'chat_delta', session, seq: 0, item: itemId, field, delta: p }));
+      this.later(session, t, () => this.chatEmit(session, { ev: 'chat_delta', session, seq: 0, item: itemId, field, delta: p, thread }));
       t += step;
     }
     return t;
+  }
+
+  private threadItem(session: string, thread: string, id: string): ChatItem | undefined {
+    return this.threads.get(session)?.get(thread)?.byId[id];
+  }
+
+  /** The sub-agent of the linux-box chat continues after its approval was answered. */
+  private subagentRespond(session: string, thread: string, itemId: string | undefined, allowed: boolean, stop: boolean) {
+    const item = itemId ? this.threadItem(session, thread, itemId) : undefined;
+    const card = Object.values(this.chats.get(session)!.byId).find((i) => i.subagent?.id === thread);
+    const finishCard = (status: 'done' | 'interrupted', reply?: string) => {
+      const cur = Object.values(this.chats.get(session)!.byId).find((i) => i.subagent?.id === thread) ?? card;
+      if (cur?.subagent) this.chatEmit(session, { ev: 'chat_item', session, seq: 0, item: { ...cur, status: status === 'done' ? 'completed' : 'declined', subagent: { ...cur.subagent, status, reply } } });
+    };
+    if (stop) {
+      if (item) this.chatEmit(session, { ev: 'chat_item', session, seq: 0, item: { ...item, status: 'declined' } });
+      finishCard('interrupted');
+      this.setStatus(session, 'idle');
+      return;
+    }
+    this.setStatus(session, 'working');
+    let t = 300;
+    if (item && allowed) {
+      t = this.streamText(session, item.id, 'output', ['# configuration file /etc/nginx/nginx.conf:\n', 'http {\n    include /etc/nginx/sites-enabled/*;\n', '}\n# configuration file /etc/nginx/sites-enabled/relay.conf:\n', '    proxy_set_header Connection "upgrade";\n    proxy_read_timeout 300s;\n'], 300, 500, thread);
+      this.later(session, t, () => {
+        const cur = this.threadItem(session, thread, item.id)!;
+        this.chatEmit(session, { ev: 'chat_item', session, seq: 0, item: { ...cur, status: 'completed', exit_code: 0, duration_ms: 2100 } });
+      });
+    } else if (item) {
+      this.chatEmit(session, { ev: 'chat_item', session, seq: 0, item: { ...item, status: 'declined' } });
+    }
+    const reply = allowed ? 'Upgrade 与 Connection 头都已转发，proxy_read_timeout 为 300 秒，满足要求。' : '没有权限读取完整配置；站点文件里 Upgrade 头已转发，Connection 头和超时未能确认。';
+    const mid = `yk_reply_${Date.now().toString(36)}`;
+    t = this.streamText(session, mid, 'text', reply.match(/[\s\S]{1,6}/g) ?? [], t + 300, 60, thread);
+    this.later(session, t, () => {
+      const cur = this.threadItem(session, thread, mid)!;
+      this.chatEmit(session, { ev: 'chat_item', session, seq: 0, item: { ...cur, status: 'completed' } });
+      finishCard('done', reply);
+    });
+    this.later(session, t + 600, () => {
+      const c = this.chats.get(session)!;
+      const y3 = c.byId.y3;
+      if (y3) this.chatEmit(session, { ev: 'chat_item', session, seq: 0, item: { ...y3, status: 'completed', text: '子智能体检查完了 nginx 配置。' } });
+      this.chatEmit(session, { ev: 'chat_item', session, seq: 0, item: { id: `y_done_${Date.now().toString(36)}`, kind: 'agent', status: 'completed', text: allowed ? 'nginx 反代配置没问题，可以继续部署 relay。' : '部分配置未能确认，部署前请手动检查 `proxy_read_timeout`。', paths: [], ts: now() } });
+      this.setStatus(session, 'idle');
+    });
   }
 
   private chatSend(session: string, text: string, attachments: string[]) {
@@ -558,6 +627,10 @@ class MockHost implements HostConnection {
     if (!c || !ap) throw new RequestError('not_found', '审批已失效');
     const opt = ap.options.find((o) => o.id === option);
     this.chatEmit(session, { ev: 'approval_resolved', session, seq: 0, approval: approvalId, option });
+    if (ap.thread) {
+      this.subagentRespond(session, ap.thread, ap.item, opt?.kind === 'allow' || opt?.kind === 'allow_always', opt?.kind === 'abort');
+      return;
+    }
     const itemId = ap.item;
     const item = itemId ? this.chats.get(session)!.byId[itemId] : undefined;
     if (!opt || opt.kind === 'deny' || opt.kind === 'abort') {
@@ -744,6 +817,7 @@ class MockHost implements HostConnection {
         preview: '接下来跑一遍中继的集成测试确认没有回归。',
       });
       this.chats.set(chatId, chatFromSnapshot({ items, approvals: [approval], status: 'awaiting_approval', seq: 41, truncated: false }));
+      this.threads.set(chatId, new Map([[MOCK_SUB_THREAD, threadFromPage(mockSubagentThread(t), false, 41)]]));
 
       const termId = 's_term_zsh';
       this.sessions.set(termId, {
@@ -790,19 +864,22 @@ class MockHost implements HostConnection {
       }));
     } else {
       const id = 's_chat_deploy';
+      const sub = mockDeploySubagent(t);
       this.sessions.set(id, {
         id, kind: 'chat', agent: 'claude', title: '部署中继到 relay-1', command: ['claude'], cwd: `${h}/deploy`, origin: 'remote', state: 'running',
         created_at: t - 50 * 60_000, updated_at: t - 6 * 60_000, cols: 80, rows: 24, clients: 0, agent_session: 'e1d2c3b4-a596-4877-8899-aabbccddeeff',
-        chat_status: 'working', pending_approvals: 0, model: 'opus', approval: 'yolo', approval_live: true, preview: '正在检查 nginx 配置中的 WebSocket 升级头…',
+        chat_status: 'awaiting_approval', pending_approvals: 1, model: 'opus', approval: 'ask', approval_live: true, preview: sub.approval.title,
       });
       this.chats.set(id, chatFromSnapshot({
         items: [
           { id: 'y1', kind: 'user', status: 'completed', text: '把 yonder-relay 部署到 relay-1，走现有 nginx 反代。', paths: [], ts: t - 50 * 60_000 },
           { id: 'y2', kind: 'command', status: 'completed', title: 'nginx -t', output: 'nginx: configuration file /etc/nginx/nginx.conf test is successful', exit_code: 0, duration_ms: 88, paths: [], ts: t - 40 * 60_000 },
-          { id: 'y3', kind: 'agent', status: 'in_progress', text: '正在检查 nginx 配置中的 WebSocket 升级头…', paths: [], ts: t - 6 * 60_000 },
+          { id: 'y3', kind: 'agent', status: 'in_progress', text: '让一个子智能体去核对 WebSocket 升级头和超时设置。', paths: [], ts: t - 7 * 60_000 },
+          sub.card,
         ],
-        approvals: [], status: 'working', seq: 12, truncated: false,
+        approvals: [sub.approval], status: 'awaiting_approval', seq: 12, truncated: false,
       }));
+      this.threads.set(id, new Map([[sub.card.id, threadFromPage(sub.thread, false, 12)]]));
       const tid = 's_term_htop';
       this.sessions.set(tid, {
         id: tid, kind: 'terminal', agent: 'shell', title: 'bash', command: ['/bin/bash', '-l'], cwd: h, origin: 'remote', state: 'exited', exit_code: 130,

@@ -1,15 +1,16 @@
 //! Codex adapter: `codex app-server` (JSON-RPC 2.0, one JSON object per line).
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use anyhow::Result;
 use serde_json::{json, Value};
 use yonder_proto::app::{
     AgentKind, Approval, ApprovalKind, ApprovalMode, ApprovalOption, ChatItem, ChatItemKind, ChatStatus, DeltaField,
-    ItemStatus, OptionKind,
+    ItemStatus, OptionKind, SubagentStatus,
 };
 
-use crate::common::{item, now_ms, random_id, truncate_tail, MAX_OUTPUT};
+use crate::common::{item, now_ms, random_id, set_subagent_status, subagent_active, subagent_card, truncate_tail, MAX_OUTPUT};
 use crate::driver::{run, Out, Protocol};
 use crate::{AdapterCmd, AdapterEvent, AdapterHandle, AgentLaunch};
 
@@ -19,6 +20,9 @@ pub fn spawn(launch: AgentLaunch) -> Result<AdapterHandle> {
     let st = CodexState::new(launch.clone());
     run(AgentKind::Codex, &launch, argv, st)
 }
+
+const SUBAGENT_RECOVERY_INTERVAL: Duration = Duration::from_secs(5);
+const SUBAGENT_RECOVERY_MAX_TICKS: u32 = 24;
 
 impl Protocol for CodexState {
     fn start(&mut self) -> Out {
@@ -48,6 +52,13 @@ impl Protocol for CodexState {
             out.event(AdapterEvent::ApprovalResolved { approval: id, option: "cancelled".into() });
         }
         self.approvals.clear();
+        // Sub-agents live inside the app-server: they are gone with it.
+        for card in self.cards.values_mut() {
+            if subagent_active(card) {
+                set_subagent_status(card, SubagentStatus::Interrupted);
+                out.event(AdapterEvent::Item(card.clone()));
+            }
+        }
         out
     }
     fn exit_error(&self) -> Option<String> {
@@ -59,7 +70,21 @@ impl Protocol for CodexState {
     fn can_release(&self) -> bool {
         // Only a thread that exists and has nothing going on: no turn, approval, request in
         // flight or message waiting.
-        self.thread.is_some() && !self.busy && self.approvals.is_empty() && self.pending.is_empty() && self.queued.is_empty() && self.after_turn.is_empty()
+        // Sub-agents keep running after the turn that spawned them; stopping the app-server
+        // would kill them.
+        self.thread.is_some()
+            && !self.busy
+            && self.approvals.is_empty()
+            && !self.pending.values().any(|p| !matches!(p, Pending::RecentTurns | Pending::SubRead(_) | Pending::SubTurns(_)))
+            && self.queued.is_empty()
+            && self.after_turn.is_empty()
+            && !self.cards.values().any(subagent_active)
+    }
+    fn poll_interval(&self) -> Option<Duration> {
+        (!self.busy && self.cards.values().any(subagent_active)).then_some(SUBAGENT_RECOVERY_INTERVAL)
+    }
+    fn on_tick(&mut self) -> Out {
+        self.recover_subagents()
     }
     fn on_release(&mut self) -> Out {
         // The app-server is gone: everything it knew is reset; the thread id stays for resuming.
@@ -106,6 +131,12 @@ enum Pending {
     TurnStart,
     /// `turn/steer` with the text and attachments it carried, to fall back to a queued turn.
     Steer(String, Vec<std::path::PathBuf>),
+    /// `thread/read` of a sub-agent's thread (its nickname and role).
+    SubRead(String),
+    /// Periodic recovery read of a child whose completion may have been lost.
+    SubProbe(String),
+    /// `thread/turns/list` of a sub-agent's thread (history of a resumed chat).
+    SubTurns(String),
     Other,
 }
 
@@ -151,6 +182,14 @@ pub struct CodexState {
     /// The app-server was started again after an idle stop: resume quietly (no history replay,
     /// no fork: the thread was ours).
     restarting: bool,
+    /// Sub-agent cards by card id (the id of the `spawnAgent` call).
+    cards: HashMap<String, ChatItem>,
+    /// Sub-agent thread id -> card id.
+    subs: HashMap<String, String>,
+    /// Sub-agent thread id -> its latest agent message (the card's reply when its turn ends).
+    sub_text: HashMap<String, String>,
+    /// Number of recovery polls since the parent became idle.
+    sub_recovery_ticks: u32,
     pub exit_error: Option<String>,
 }
 
@@ -174,6 +213,8 @@ fn sandbox_policy(mode: ApprovalMode) -> Value {
 
 /// Turns of a resumed thread replayed into the chat (older ones stay in Codex's files).
 const REPLAY_TURNS: u32 = 10;
+/// Sub-agents of a resumed thread whose threads are fetched for their read-only views.
+const REPLAY_SUBAGENTS: usize = 8;
 
 fn s(v: &Value, k: &str) -> Option<String> {
     v.get(k).and_then(|x| x.as_str()).map(str::to_string)
@@ -202,8 +243,59 @@ impl CodexState {
             after_turn: Vec::new(),
             released: None,
             restarting: false,
+            cards: HashMap::new(),
+            subs: HashMap::new(),
+            sub_text: HashMap::new(),
+            sub_recovery_ticks: 0,
             exit_error: None,
         }
+    }
+
+    fn recover_subagents(&mut self) -> Out {
+        let mut out = Out::default();
+        if self.busy || !self.cards.values().any(subagent_active) {
+            self.sub_recovery_ticks = 0;
+            return out;
+        }
+        self.sub_recovery_ticks = self.sub_recovery_ticks.saturating_add(1);
+        let active: Vec<String> = self
+            .cards
+            .values()
+            .filter_map(|card| card.subagent.as_ref().filter(|sub| sub.status == SubagentStatus::Running).map(|sub| sub.id.clone()))
+            .filter(|tid| !tid.is_empty())
+            .collect();
+        if self.sub_recovery_ticks >= SUBAGENT_RECOVERY_MAX_TICKS {
+            for tid in active {
+                self.update_card(&tid, &mut out, |c| {
+                    c.status = SubagentStatus::Interrupted;
+                    if c.reply.is_none() {
+                        c.reply = Some("Sub-agent state could not be recovered.".into());
+                    }
+                });
+            }
+            let approvals: Vec<String> = self.approvals.keys().cloned().collect();
+            for id in approvals {
+                if let Some(p) = self.approvals.remove(&id) {
+                    out.to_agent.push(Self::decision(&p, "abort"));
+                    out.events.push(AdapterEvent::ApprovalResolved { approval: id, option: "cancelled".into() });
+                }
+            }
+            self.pending.retain(|_, p| !matches!(p, Pending::SubProbe(_)));
+            self.sub_recovery_ticks = 0;
+            out.status(ChatStatus::Idle, Some("Sub-agent state could not be recovered.".into()));
+            return out;
+        }
+        for tid in active {
+            if self.pending.values().any(|p| matches!(p, Pending::SubProbe(id) if id == &tid)) {
+                continue;
+            }
+            let m = self.request("thread/read", json!({"threadId": tid}));
+            if let Some(id) = m.get("id").and_then(|i| i.as_u64()) {
+                self.pending.insert(id, Pending::SubProbe(tid));
+            }
+            out.to_agent.push(m);
+        }
+        out
     }
 
     /// Status detail while a turn waits for MCP servers to start.
@@ -342,8 +434,9 @@ impl CodexState {
                 if let Some(p) = self.approvals.remove(&approval_id) {
                     out.to_agent.push(Self::decision(&p, &option_id));
                     out.events.push(AdapterEvent::ApprovalResolved { approval: approval_id, option: option_id });
-                    if self.approvals.is_empty() && self.busy {
-                        out.events.push(AdapterEvent::Status { status: ChatStatus::Working, detail: None });
+                    // A sub-agent may ask after the parent's turn ended.
+                    if self.approvals.is_empty() {
+                        out.events.push(AdapterEvent::Status { status: if self.busy { ChatStatus::Working } else { ChatStatus::Idle }, detail: None });
                     }
                 }
             }
@@ -428,8 +521,18 @@ impl CodexState {
                     return;
                 }
             }
-            // History replay is optional (older Codex has no `thread/turns/list`).
-            if matches!(kind, Pending::RecentTurns) {
+            if let Pending::SubProbe(tid) = &kind {
+                self.update_card(tid, out, |c| {
+                    c.status = SubagentStatus::Interrupted;
+                    if c.reply.is_none() {
+                        c.reply = Some("Sub-agent state could not be recovered.".into());
+                    }
+                });
+                return;
+            }
+            // History replay and sub-agent details are optional (older Codex has no
+            // `thread/turns/list`; a sub-agent's thread may be gone).
+            if matches!(kind, Pending::RecentTurns | Pending::SubRead(_) | Pending::SubTurns(_)) {
                 return;
             }
             let mut it = item(format!("err-{n}"), ChatItemKind::Error, ItemStatus::Failed);
@@ -514,6 +617,54 @@ impl CodexState {
                 turns.reverse();
                 self.replay(&turns, out);
             }
+            Pending::SubRead(tid) => {
+                let t = result.get("thread").cloned().unwrap_or(Value::Null);
+                let Some(card) = self.subs.get(&tid).and_then(|c| self.cards.get_mut(c)) else { return };
+                let Some(sub) = card.subagent.as_mut() else { return };
+                let before = sub.clone();
+                if let Some(n) = s(&t, "agentNickname").filter(|n| !n.is_empty()) {
+                    sub.name = Some(n);
+                }
+                if let Some(r) = s(&t, "agentRole").filter(|r| !r.is_empty()) {
+                    sub.role = Some(r);
+                }
+                if sub.model.is_none() {
+                    sub.model = s(&t, "model").filter(|m| !m.is_empty());
+                }
+                if *sub != before {
+                    out.events.push(AdapterEvent::Item(card.clone()));
+                }
+            }
+            Pending::SubProbe(tid) => {
+                let status = result
+                    .get("thread")
+                    .and_then(|t| t.get("status"))
+                    .and_then(|s| s.get("type"))
+                    .and_then(Value::as_str);
+                match status {
+                    Some("idle") => self.update_card(&tid, out, |c| c.status = SubagentStatus::Done),
+                    Some("systemError") => self.update_card(&tid, out, |c| c.status = SubagentStatus::Failed),
+                    Some("notLoaded") | None => self.update_card(&tid, out, |c| {
+                        c.status = SubagentStatus::Interrupted;
+                        if c.reply.is_none() {
+                            c.reply = Some("Sub-agent state could not be recovered.".into());
+                        }
+                    }),
+                    _ => {}
+                }
+            }
+            Pending::SubTurns(tid) => {
+                let mut turns: Vec<Value> = result.get("data").and_then(|d| d.as_array()).cloned().unwrap_or_default();
+                turns.reverse();
+                for turn in &turns {
+                    for it in turn.get("items").and_then(|i| i.as_array()).into_iter().flatten() {
+                        if let Some(mut ci) = self.map_item(it, true) {
+                            ci.thread = Some(tid.clone());
+                            out.events.push(AdapterEvent::Item(ci));
+                        }
+                    }
+                }
+            }
             Pending::Steer(..) | Pending::Other => {}
         }
     }
@@ -570,6 +721,9 @@ impl CodexState {
             out.to_agent.push(Self::decision(&pending, "allow"));
             return;
         }
+        // Sub-agents share this connection: their requests carry their own thread id.
+        let thread = s(&params, "threadId").filter(|t| self.thread.as_ref().is_some_and(|own| own != t));
+        let thread_name = thread.as_ref().and_then(|t| self.sub_name(t));
         let approval = Approval {
             id: approval_id.clone(),
             kind,
@@ -582,16 +736,240 @@ impl CodexState {
             options,
             item: item_id,
             ts: now_ms(),
+            thread,
+            thread_name,
         };
         self.approvals.insert(approval_id, pending);
         out.events.push(AdapterEvent::ApprovalRequested(approval));
         out.events.push(AdapterEvent::Status { status: ChatStatus::AwaitingApproval, detail: None });
     }
 
+    /// Sub-agents run in their own threads on the same app-server connection, so their
+    /// notifications arrive here too: the thread id when it is not this chat's own. Their turns
+    /// must not replace this thread's turn id (`turn/interrupt` would fail with "expected active
+    /// turn id ... but found ...") or end it.
+    fn other_thread(&self, p: &Value) -> Option<String> {
+        match (p.get("threadId").and_then(|t| t.as_str()), self.thread.as_deref()) {
+            (Some(t), Some(own)) if t != own => Some(t.to_string()),
+            _ => None,
+        }
+    }
+
+    /// Display name of a sub-agent (nickname, else role) by thread id.
+    fn sub_name(&self, tid: &str) -> Option<String> {
+        let sub = self.subs.get(tid).and_then(|c| self.cards.get(c)).and_then(|c| c.subagent.as_ref())?;
+        sub.name.clone().or_else(|| sub.role.clone())
+    }
+
+    /// Streaming deltas: (item, field, text).
+    fn delta(method: &str, p: &Value) -> Option<(String, DeltaField, String)> {
+        let field = match method {
+            "item/agentMessage/delta" | "item/plan/delta" | "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => DeltaField::Text,
+            "item/reasoning/summaryPartAdded" => return Some((s(p, "itemId")?, DeltaField::Text, "\n\n".into())),
+            "item/commandExecution/outputDelta" | "item/fileChange/outputDelta" => DeltaField::Output,
+            _ => return None,
+        };
+        Some((s(p, "itemId")?, field, s(p, "delta")?))
+    }
+
+    /// Notifications of a sub-agent's thread: its items go to its read-only view (`thread`),
+    /// its turns drive its card.
+    fn on_sub_notification(&mut self, tid: &str, method: &str, p: Value, out: &mut Out) {
+        if let Some((item, field, delta)) = Self::delta(method, &p) {
+            out.events.push(AdapterEvent::Delta { item, field, delta, thread: Some(tid.to_string()) });
+            return;
+        }
+        match method {
+            "turn/started" => self.update_card(tid, out, |c| {
+                if c.status != SubagentStatus::Closed {
+                    c.status = SubagentStatus::Running;
+                }
+            }),
+            "turn/completed" => {
+                let turn = p.get("turn").cloned().unwrap_or(Value::Null);
+                let status = s(&turn, "status").unwrap_or_default();
+                if status == "failed" {
+                    let msg = turn.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()).unwrap_or("turn failed").to_string();
+                    let mut it = item(format!("turnerr-{}", now_ms()), ChatItemKind::Error, ItemStatus::Failed);
+                    it.text = Some(msg);
+                    it.thread = Some(tid.to_string());
+                    out.events.push(AdapterEvent::Item(it));
+                }
+                let open: Vec<String> = self
+                    .items
+                    .iter()
+                    .filter(|(_, i)| i.status == ItemStatus::InProgress && i.thread.as_deref() == Some(tid))
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                for k in open {
+                    if let Some(mut it) = self.items.remove(&k) {
+                        it.status = if status == "interrupted" { ItemStatus::Declined } else { ItemStatus::Completed };
+                        out.events.push(AdapterEvent::Item(it));
+                    }
+                }
+                let reply = self.sub_text.get(tid).cloned();
+                self.update_card(tid, out, |c| {
+                    if c.status != SubagentStatus::Closed {
+                        c.status = match status.as_str() {
+                            "failed" => SubagentStatus::Failed,
+                            "interrupted" => SubagentStatus::Interrupted,
+                            _ => SubagentStatus::Done,
+                        };
+                    }
+                    if reply.is_some() {
+                        c.reply = reply;
+                    }
+                });
+            }
+            "item/started" | "item/completed" => {
+                let completed = method == "item/completed";
+                let Some(it) = p.get("item") else { return };
+                if s(it, "type").as_deref() == Some("collabAgentToolCall") {
+                    self.collab(it, completed, Some(tid), out);
+                    return;
+                }
+                let Some(mut ci) = self.map_item(it, completed) else { return };
+                ci.thread = Some(tid.to_string());
+                if completed {
+                    self.items.remove(&ci.id);
+                    if ci.kind == ChatItemKind::Agent {
+                        if let Some(t) = ci.text.clone().filter(|t| !t.trim().is_empty()) {
+                            self.sub_text.insert(tid.to_string(), t);
+                        }
+                    }
+                } else {
+                    self.items.insert(ci.id.clone(), ci.clone());
+                }
+                out.events.push(AdapterEvent::Item(ci));
+            }
+            "thread/status/changed" => {
+                let st = p.get("status").cloned().unwrap_or(Value::Null);
+                let flags = st.get("activeFlags").and_then(|f| f.as_array()).cloned().unwrap_or_default();
+                if flags.iter().any(|f| f.as_str() == Some("waitingOnApproval")) {
+                    out.events.push(AdapterEvent::Status { status: ChatStatus::AwaitingApproval, detail: None });
+                }
+                if s(&st, "type").as_deref() == Some("systemError") {
+                    self.update_card(tid, out, |c| c.status = SubagentStatus::Failed);
+                }
+            }
+            "error" if !p.get("willRetry").and_then(|w| w.as_bool()).unwrap_or(false) => {
+                let msg = p.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()).map(str::to_string).unwrap_or_else(|| "error".into());
+                let mut it = item(format!("err-{}", now_ms()), ChatItemKind::Error, ItemStatus::Failed);
+                it.text = Some(msg);
+                it.thread = Some(tid.to_string());
+                out.events.push(AdapterEvent::Item(it));
+            }
+            // MCP startup, warnings, token usage of the sub-agent: not this chat's.
+            _ => {}
+        }
+    }
+
+    /// Changes the card of the sub-agent with thread `tid` and sends it when it changed.
+    fn update_card(&mut self, tid: &str, out: &mut Out, f: impl FnOnce(&mut yonder_proto::app::Subagent)) {
+        let Some(card) = self.subs.get(tid).and_then(|c| self.cards.get_mut(c)) else { return };
+        let Some(sub) = card.subagent.as_mut() else { return };
+        let before = (sub.clone(), card.status);
+        f(sub);
+        let status = sub.status;
+        set_subagent_status(card, status);
+        if card.subagent.as_ref() != Some(&before.0) || card.status != before.1 {
+            out.events.push(AdapterEvent::Item(card.clone()));
+        }
+    }
+
+    /// A `collabAgentToolCall` item: `spawnAgent` creates a card, every other call (wait,
+    /// send_input, close_agent, resume_agent, ...) only updates the cards of its targets.
+    /// `thread`: the sub-agent that made the call (a nested spawn), None for this chat.
+    fn collab(&mut self, it: &Value, completed: bool, thread: Option<&str>, out: &mut Out) {
+        let tool = s(it, "tool").unwrap_or_default();
+        let call_failed = matches!(s(it, "status").as_deref(), Some("failed"));
+        let receivers: Vec<String> = it.get("receiverThreadIds").and_then(|r| r.as_array()).into_iter().flatten().filter_map(|x| x.as_str().map(str::to_string)).collect();
+        if tool == "spawnAgent" {
+            let Some(id) = s(it, "id") else { return };
+            let card = self.cards.entry(id.clone()).or_insert_with(|| {
+                let mut c = subagent_card(&id, "", SubagentStatus::Running);
+                c.thread = thread.map(str::to_string);
+                c
+            });
+            let before = (card.subagent.clone(), card.text.clone(), card.status);
+            if let Some(p) = s(it, "prompt").filter(|p| !p.trim().is_empty()) {
+                card.text = Some(p);
+            }
+            let mut new_thread = None;
+            if let Some(sub) = card.subagent.as_mut() {
+                if let Some(m) = s(it, "model").filter(|m| !m.is_empty()) {
+                    sub.model = Some(m);
+                }
+                if let Some(r) = receivers.first().filter(|r| sub.id != **r) {
+                    sub.id = r.clone();
+                    new_thread = Some(r.clone());
+                }
+            }
+            if completed && call_failed && receivers.is_empty() {
+                set_subagent_status(card, SubagentStatus::Failed);
+            }
+            let changed = before != (card.subagent.clone(), card.text.clone(), card.status);
+            let card = card.clone();
+            if let Some(r) = new_thread {
+                self.subs.insert(r.clone(), id);
+                // Nickname and role are only on the sub-agent's thread.
+                let m = self.request("thread/read", json!({"threadId": r}));
+                if let Some(n) = m.get("id").and_then(|i| i.as_u64()) {
+                    self.pending.insert(n, Pending::SubRead(r));
+                }
+                out.to_agent.push(m);
+            }
+            if changed {
+                out.events.push(AdapterEvent::Item(card));
+            }
+        }
+        // Every call reports the latest known state of its targets.
+        if let Some(states) = it.get("agentsStates").and_then(|a| a.as_object()) {
+            for (tid, st) in states {
+                let status = match s(st, "status").as_deref() {
+                    Some("pendingInit" | "running") => SubagentStatus::Running,
+                    Some("completed") => SubagentStatus::Done,
+                    Some("errored") => SubagentStatus::Failed,
+                    Some("interrupted") => SubagentStatus::Interrupted,
+                    Some("shutdown") => SubagentStatus::Closed,
+                    _ => continue,
+                };
+                let reply = s(st, "message").filter(|m| !m.trim().is_empty());
+                self.update_card(tid, out, |c| {
+                    // Closed stays closed until the agent is resumed.
+                    if c.status != SubagentStatus::Closed || tool == "resumeAgent" {
+                        c.status = status;
+                    }
+                    if reply.is_some() {
+                        c.reply = reply;
+                    }
+                });
+            }
+        }
+        match tool.as_str() {
+            "closeAgent" if completed && !call_failed => {
+                for r in &receivers {
+                    self.update_card(r, out, |c| c.status = SubagentStatus::Closed);
+                }
+            }
+            "sendInput" | "sendMessage" | "followupTask" | "resumeAgent" if !completed => {
+                for r in &receivers {
+                    self.update_card(r, out, |c| c.status = SubagentStatus::Running);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn on_notification(&mut self, method: &str, p: Value, out: &mut Out) {
+        if let Some(tid) = self.other_thread(&p).filter(|_| method != "serverRequest/resolved") {
+            self.on_sub_notification(&tid, method, p, out);
+            return;
+        }
         match method {
             "turn/started" => {
                 self.busy = true;
+                self.sub_recovery_ticks = 0;
                 if let Some(t) = p.get("turn").and_then(|t| s(t, "id")) {
                     self.turn = Some(t);
                 }
@@ -609,15 +987,15 @@ impl CodexState {
                     it.text = Some(msg);
                     out.events.push(AdapterEvent::Item(it));
                 }
-                // Anything still in progress is done now.
-                let open: Vec<String> = self.items.iter().filter(|(_, i)| i.status == ItemStatus::InProgress).map(|(k, _)| k.clone()).collect();
+                // Anything still in progress is done now (sub-agents may outlive the turn).
+                let open: Vec<String> = self.items.iter().filter(|(_, i)| i.status == ItemStatus::InProgress && i.thread.is_none()).map(|(k, _)| k.clone()).collect();
                 for k in open {
                     if let Some(mut it) = self.items.remove(&k) {
                         it.status = if status == "interrupted" { ItemStatus::Declined } else { ItemStatus::Completed };
                         out.events.push(AdapterEvent::Item(it));
                     }
                 }
-                self.items.clear();
+                self.items.retain(|_, i| i.thread.is_some());
                 out.events.push(AdapterEvent::Status { status: ChatStatus::Idle, detail: if status == "interrupted" { Some("interrupted".into()) } else { None } });
                 // A message that could not steer the finished turn starts the next one.
                 self.flush_held(out);
@@ -625,6 +1003,10 @@ impl CodexState {
             "item/started" | "item/completed" => {
                 let completed = method == "item/completed";
                 if let Some(it) = p.get("item") {
+                    if s(it, "type").as_deref() == Some("collabAgentToolCall") {
+                        self.collab(it, completed, None, out);
+                        return;
+                    }
                     if let Some(ci) = self.map_item(it, completed) {
                         if completed {
                             self.items.remove(&ci.id);
@@ -635,24 +1017,9 @@ impl CodexState {
                     }
                 }
             }
-            "item/agentMessage/delta" | "item/plan/delta" => {
-                if let (Some(item), Some(d)) = (s(&p, "itemId"), s(&p, "delta")) {
-                    out.events.push(AdapterEvent::Delta { item, field: DeltaField::Text, delta: d });
-                }
-            }
-            "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => {
-                if let (Some(item), Some(d)) = (s(&p, "itemId"), s(&p, "delta")) {
-                    out.events.push(AdapterEvent::Delta { item, field: DeltaField::Text, delta: d });
-                }
-            }
-            "item/reasoning/summaryPartAdded" => {
-                if let Some(item) = s(&p, "itemId") {
-                    out.events.push(AdapterEvent::Delta { item, field: DeltaField::Text, delta: "\n\n".into() });
-                }
-            }
-            "item/commandExecution/outputDelta" | "item/fileChange/outputDelta" => {
-                if let (Some(item), Some(d)) = (s(&p, "itemId"), s(&p, "delta")) {
-                    out.events.push(AdapterEvent::Delta { item, field: DeltaField::Output, delta: d });
+            m if Self::delta(m, &p).is_some() => {
+                if let Some((item, field, delta)) = Self::delta(m, &p) {
+                    out.events.push(AdapterEvent::Delta { item, field, delta, thread: None });
                 }
             }
             "serverRequest/resolved" => {
@@ -718,15 +1085,36 @@ impl CodexState {
         }
     }
 
-    /// Map a Codex ThreadItem to a ChatItem.
-    /// History items of resumed turns.
-    fn replay(&self, turns: &[Value], out: &mut Out) {
+    /// History items of resumed turns. Sub-agent cards come with the last state Codex
+    /// recorded; the sub-agents' own threads are fetched for their read-only views.
+    fn replay(&mut self, turns: &[Value], out: &mut Out) {
+        let known: std::collections::HashSet<String> = self.subs.keys().cloned().collect();
         for turn in turns {
             for it in turn.get("items").and_then(|i| i.as_array()).into_iter().flatten() {
-                if let Some(ci) = self.map_item(it, true) {
+                if s(it, "type").as_deref() == Some("collabAgentToolCall") {
+                    self.collab(it, true, None, out);
+                } else if let Some(ci) = self.map_item(it, true) {
                     out.events.push(AdapterEvent::Item(ci));
                 }
             }
+        }
+        let mut fresh: Vec<String> = self.subs.keys().filter(|t| !known.contains(*t)).cloned().collect();
+        fresh.sort();
+        // Sub-agents of an earlier app-server are gone: one still marked running was cut off.
+        for tid in &fresh {
+            self.update_card(tid, out, |c| {
+                if c.status == SubagentStatus::Running {
+                    c.status = SubagentStatus::Interrupted;
+                }
+            });
+        }
+        // Thread ids are time-ordered (UUIDv7): fetch the newest few.
+        for tid in fresh.into_iter().rev().take(REPLAY_SUBAGENTS) {
+            let m = self.request("thread/turns/list", json!({"threadId": tid, "limit": REPLAY_TURNS, "itemsView": "full"}));
+            if let Some(n) = m.get("id").and_then(|i| i.as_u64()) {
+                self.pending.insert(n, Pending::SubTurns(tid));
+            }
+            out.to_agent.push(m);
         }
     }
 
@@ -1184,6 +1572,26 @@ mod tests {
         assert_eq!(start["params"]["input"][0]["text"], "three");
     }
 
+    /// A sub-agent's turns arrive on the parent's connection: they must not replace the
+    /// parent's turn, end it, or be what Stop interrupts.
+    #[test]
+    fn sub_agent_turns_do_not_touch_the_parent_turn() {
+        let mut st = CodexState::new(launch());
+        st.thread = Some("parent".into());
+        st.on_message(&json!({"jsonrpc": "2.0", "method": "turn/started", "params": {"threadId": "parent", "turn": {"id": "turn-p"}}}));
+        st.on_message(&json!({"jsonrpc": "2.0", "method": "turn/started", "params": {"threadId": "child", "turn": {"id": "turn-c"}}}));
+        assert_eq!(st.turn.as_deref(), Some("turn-p"));
+
+        let out = st.on_message(&json!({"jsonrpc": "2.0", "method": "turn/completed", "params": {"threadId": "child", "turn": {"id": "turn-c", "status": "completed"}}}));
+        assert!(out.events.is_empty(), "{:?}", out.events);
+        assert!(st.busy);
+
+        let out = st.on_cmd(AdapterCmd::Interrupt);
+        assert_eq!(out.to_agent[0]["method"], "turn/interrupt");
+        assert_eq!(out.to_agent[0]["params"]["threadId"], "parent");
+        assert_eq!(out.to_agent[0]["params"]["turnId"], "turn-p");
+    }
+
     /// A steer that loses the race with the end of its turn is sent as a new turn.
     #[test]
     fn steer_after_turn_ended_starts_a_turn() {
@@ -1273,5 +1681,293 @@ mod tests {
         let m = st.request("thread/turns/list", json!({}));
         let out = st.on_message(&json!({"jsonrpc": "2.0", "id": m["id"].clone(), "error": {"code": -32601, "message": "unknown method"}}));
         assert!(out.events.is_empty());
+    }
+
+    /// Final state of every item (by id, in first-seen order), deltas applied.
+    fn final_items(evs: &[AdapterEvent]) -> Vec<ChatItem> {
+        let mut order: Vec<String> = Vec::new();
+        let mut map: HashMap<String, ChatItem> = HashMap::new();
+        for e in evs {
+            match e {
+                AdapterEvent::Item(i) => {
+                    if !map.contains_key(&i.id) {
+                        order.push(i.id.clone());
+                    }
+                    map.insert(i.id.clone(), i.clone());
+                }
+                AdapterEvent::Delta { item, field, delta, thread } => {
+                    let it = map.entry(item.clone()).or_insert_with(|| {
+                        order.push(item.clone());
+                        let mut c = ChatItem::new(item.clone(), ChatItemKind::Agent, ItemStatus::InProgress, 0);
+                        c.thread = thread.clone();
+                        c
+                    });
+                    assert_eq!(&it.thread, thread, "delta for {item} in another thread");
+                    match field {
+                        DeltaField::Text => it.text.get_or_insert_with(String::new).push_str(delta),
+                        DeltaField::Output => it.output.get_or_insert_with(String::new).push_str(delta),
+                    }
+                }
+                _ => {}
+            }
+        }
+        order.into_iter().filter_map(|id| map.remove(&id)).collect()
+    }
+
+    /// Real run (codex-cli 0.154): the parent spawns one sub-agent, waits for it, closes it. The
+    /// sub-agent asks to run a command outside the sandbox.
+    #[test]
+    fn subagent_card_thread_and_approval_from_recording() {
+        let (st, evs) = replay("codex_subagent_approval.jsonl");
+        let parent = st.thread.clone().unwrap();
+        let child = "01a115ca-eec7-75a3-9ebb-d0408cc774d4";
+        let items = final_items(&evs);
+
+        // One card for the spawn; wait / close only update it.
+        let cards: Vec<&ChatItem> = items.iter().filter(|i| i.kind == ChatItemKind::Subagent).collect();
+        assert_eq!(cards.len(), 1, "{cards:?}");
+        let card = cards[0];
+        assert!(card.thread.is_none());
+        let sub = card.subagent.as_ref().unwrap();
+        assert_eq!(sub.id, child);
+        assert_eq!(sub.model.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(sub.status, SubagentStatus::Closed);
+        assert_eq!(sub.reply.as_deref(), Some("DONE"));
+        assert_eq!(card.status, ItemStatus::Completed);
+        assert!(card.text.as_deref().unwrap().starts_with("Run the shell command: touch"));
+        // The card went through running before it ended.
+        assert!(evs.iter().any(|e| matches!(e, AdapterEvent::Item(i) if i.id == card.id && i.subagent.as_ref().unwrap().status == SubagentStatus::Running)));
+        assert!(!items.iter().any(|i| i.kind == ChatItemKind::Tool), "collab calls are not tool rows: {items:?}");
+
+        // The sub-agent's own items belong to its thread, the parent's to the chat.
+        let child_items: Vec<&ChatItem> = items.iter().filter(|i| i.thread.as_deref() == Some(child)).collect();
+        assert!(child_items.iter().any(|i| i.kind == ChatItemKind::User && i.text.as_deref().unwrap().contains("touch")));
+        let cmd = child_items.iter().find(|i| i.kind == ChatItemKind::Command).expect("sub-agent command");
+        assert_eq!(cmd.status, ItemStatus::Completed);
+        assert!(child_items.iter().any(|i| i.kind == ChatItemKind::Agent && i.text.as_deref() == Some("DONE")));
+        assert!(child_items.iter().any(|i| i.kind == ChatItemKind::Reasoning));
+        let own: Vec<&ChatItem> = items.iter().filter(|i| i.thread.is_none() && i.kind == ChatItemKind::Agent).collect();
+        assert_eq!(own.len(), 1, "{own:?}");
+        assert!(items.iter().all(|i| i.thread.is_none() || i.thread.as_deref() == Some(child)));
+
+        // The approval reaches the chat, attributed to the sub-agent.
+        let approval = evs
+            .iter()
+            .find_map(|e| match e {
+                AdapterEvent::ApprovalRequested(a) => Some(a.clone()),
+                _ => None,
+            })
+            .expect("sub-agent approval");
+        assert_eq!(approval.thread.as_deref(), Some(child));
+        assert_eq!(approval.kind, ApprovalKind::Command);
+        assert_eq!(approval.command.as_deref(), Some("/bin/bash -lc 'touch /tmp/work/cx1/outside/sub_approval.txt'"));
+        assert_ne!(approval.thread.as_deref(), Some(parent.as_str()));
+        // Codex resolved it (the recorder answered): it is gone.
+        assert!(evs.iter().any(|e| matches!(e, AdapterEvent::ApprovalResolved { approval: a, .. } if *a == approval.id)));
+        assert!(st.approvals.is_empty());
+
+        // The sub-agent's turn did not end the parent's: idle only once, at the very end.
+        let idles = evs.iter().filter(|e| matches!(e, AdapterEvent::Status { status: ChatStatus::Idle, .. })).count();
+        assert_eq!(idles, 2, "thread start + parent turn end");
+        assert!(matches!(evs.last(), Some(AdapterEvent::Status { status: ChatStatus::Idle, .. })));
+    }
+
+    /// The spawn asks Codex for the sub-agent's thread; its nickname names the card.
+    #[test]
+    fn subagent_nickname_from_thread_read() {
+        let path = format!("{}/tests/fixtures/codex_subagent_read.jsonl", env!("CARGO_MANIFEST_DIR"));
+        let lines: Vec<Value> = std::fs::read_to_string(path).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        // The recorder's own `thread/read` answer (id 4) stands in for ours.
+        let read = lines
+            .iter()
+            .filter_map(|o| o.get("raw").and_then(|r| r.as_str()))
+            .filter_map(|r| serde_json::from_str::<Value>(r).ok())
+            .find(|v| v.get("id") == Some(&json!(4)) && v.get("result").is_some())
+            .unwrap();
+        let mut st = CodexState::new(launch());
+        st.pending.insert(1, Pending::Initialize);
+        st.next_id = 100;
+        let mut asked = None;
+        let mut evs = Vec::new();
+        for o in &lines {
+            let Some(raw) = o.get("raw").and_then(|r| r.as_str()) else { continue };
+            let v: Value = serde_json::from_str(raw).unwrap();
+            match v.get("id").and_then(|i| i.as_u64()) {
+                Some(2) if v.get("method").is_none() => {
+                    st.pending.insert(2, Pending::ThreadStart);
+                }
+                Some(3) if v.get("method").is_none() => {
+                    st.pending.insert(3, Pending::TurnStart);
+                }
+                Some(4 | 5) if v.get("method").is_none() => continue,
+                _ => {}
+            }
+            let out = st.on_message(&v);
+            if let Some(m) = out.to_agent.iter().find(|m| m["method"] == "thread/read") {
+                asked = Some(m.clone());
+            }
+            evs.extend(out.events);
+        }
+        let asked = asked.expect("thread/read for the sub-agent");
+        assert_eq!(asked["params"]["threadId"], "01a115ff-bc19-76a0-95f5-72544357b88b");
+        let mut answer = read.clone();
+        answer["id"] = asked["id"].clone();
+        let out = st.on_message(&answer);
+        let card = out
+            .events
+            .iter()
+            .find_map(|e| match e {
+                AdapterEvent::Item(i) if i.kind == ChatItemKind::Subagent => Some(i.clone()),
+                _ => None,
+            })
+            .expect("card updated");
+        let sub = card.subagent.unwrap();
+        assert_eq!(sub.name.as_deref(), Some("Linnaeus"));
+        // It was closed meanwhile; naming it keeps that.
+        assert_eq!(sub.status, SubagentStatus::Closed);
+        assert_eq!(sub.reply.as_deref(), Some("DONE"));
+        // A sub-agent approval names it once the name is known.
+        assert_eq!(st.sub_name("01a115ff-bc19-76a0-95f5-72544357b88b").as_deref(), Some("Linnaeus"));
+    }
+
+    fn spawn_item(id: &str, status: &str, receivers: &[&str], states: Value) -> Value {
+        json!({"type": "collabAgentToolCall", "id": id, "tool": "spawnAgent", "status": status, "senderThreadId": "parent",
+            "receiverThreadIds": receivers, "prompt": "look around", "model": "m1", "reasoningEffort": "low", "agentsStates": states})
+    }
+
+    /// A sub-agent still running keeps the app-server (it would die with it); answering its
+    /// approval after the parent turn ended leaves the chat idle, not working.
+    #[test]
+    fn running_subagent_blocks_idle_release_and_approval_after_turn() {
+        let mut st = CodexState::new(launch());
+        st.thread = Some("parent".into());
+        st.on_message(&json!({"jsonrpc": "2.0", "method": "turn/started", "params": {"threadId": "parent", "turn": {"id": "tp"}}}));
+        let out = st.on_message(&json!({"jsonrpc": "2.0", "method": "item/completed", "params": {"threadId": "parent", "item": spawn_item("sp1", "completed", &["kid"], json!({"kid": {"status": "pendingInit", "message": null}}))}}));
+        let read = out.to_agent.iter().find(|m| m["method"] == "thread/read").unwrap();
+        st.on_message(&json!({"id": read["id"].clone(), "result": {"thread": {"id": "kid", "agentNickname": "Ada", "agentRole": "explorer"}}}));
+        st.on_message(&json!({"jsonrpc": "2.0", "method": "turn/completed", "params": {"threadId": "parent", "turn": {"id": "tp", "status": "completed"}}}));
+        assert!(!st.busy);
+        assert!(!st.can_release(), "sub-agent still running");
+
+        let out = st.on_message(&json!({"jsonrpc": "2.0", "id": 7, "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "kid", "turnId": "tk", "itemId": "c1", "command": "ls", "cwd": "/tmp"}}));
+        let a = out.events.iter().find_map(|e| match e { AdapterEvent::ApprovalRequested(a) => Some(a.clone()), _ => None }).unwrap();
+        assert_eq!(a.thread.as_deref(), Some("kid"));
+        assert_eq!(a.thread_name.as_deref(), Some("Ada"));
+        let out = st.on_cmd(AdapterCmd::Approve { approval_id: a.id, option_id: "allow".into() });
+        assert_eq!(out.to_agent[0]["result"]["decision"], "accept");
+        assert!(out.events.iter().any(|e| matches!(e, AdapterEvent::Status { status: ChatStatus::Idle, .. })));
+
+        let out = st.on_message(&json!({"jsonrpc": "2.0", "method": "turn/completed", "params": {"threadId": "kid", "turn": {"id": "tk", "status": "completed"}}}));
+        let card = out.events.iter().find_map(|e| match e { AdapterEvent::Item(i) => Some(i.clone()), _ => None }).unwrap();
+        assert_eq!(card.subagent.unwrap().status, SubagentStatus::Done);
+        assert!(st.can_release());
+    }
+
+    #[test]
+    fn idle_parent_probes_running_subagent_and_releases_after_completion() {
+        let mut st = CodexState::new(launch());
+        st.thread = Some("parent".into());
+        let out = st.on_message(&json!({
+            "jsonrpc": "2.0",
+            "method": "item/completed",
+            "params": {"threadId": "parent", "item": spawn_item("sp1", "completed", &["kid"], json!({"kid": {"status": "running"}}))}
+        }));
+        let read = out.to_agent.iter().find(|m| m["method"] == "thread/read").unwrap();
+        st.on_message(&json!({"id": read["id"].clone(), "result": {"thread": {"id": "kid"}}}));
+        assert!(!st.can_release());
+
+        let out = st.on_tick();
+        let probe = out.to_agent.iter().find(|m| m["method"] == "thread/read").expect("recovery probe");
+        let out = st.on_message(&json!({
+            "id": probe["id"].clone(),
+            "result": {"thread": {"id": "kid", "status": {"type": "idle"}}}
+        }));
+        assert!(out.events.iter().any(|e| matches!(e, AdapterEvent::Item(i)
+            if i.kind == ChatItemKind::Subagent && i.subagent.as_ref().is_some_and(|s| s.status == SubagentStatus::Done))));
+        assert!(st.can_release());
+    }
+
+    #[test]
+    fn idle_parent_bounds_lost_subagent_recovery() {
+        let mut st = CodexState::new(launch());
+        st.thread = Some("parent".into());
+        let out = st.on_message(&json!({
+            "jsonrpc": "2.0",
+            "method": "item/completed",
+            "params": {"threadId": "parent", "item": spawn_item("sp1", "completed", &["kid"], json!({"kid": {"status": "running"}}))}
+        }));
+        let read = out.to_agent.iter().find(|m| m["method"] == "thread/read").unwrap();
+        st.on_message(&json!({"id": read["id"].clone(), "result": {"thread": {"id": "kid"}}}));
+        let out = st.on_message(&json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "kid", "itemId": "c1", "command": "ls"}
+        }));
+        assert!(out.events.iter().any(|e| matches!(e, AdapterEvent::ApprovalRequested(_))));
+        st.sub_recovery_ticks = SUBAGENT_RECOVERY_MAX_TICKS - 1;
+
+        let out = st.on_tick();
+        assert!(out.events.iter().any(|e| matches!(e, AdapterEvent::Item(i)
+            if i.kind == ChatItemKind::Subagent && i.subagent.as_ref().is_some_and(|s| s.status == SubagentStatus::Interrupted))));
+        assert!(out.events.iter().any(|e| matches!(e, AdapterEvent::ApprovalResolved { option, .. } if option == "cancelled")));
+        assert!(out.events.iter().any(|e| matches!(e, AdapterEvent::Status { status: ChatStatus::Idle, .. })));
+        assert!(st.can_release());
+    }
+
+    /// Sub-agent items carry their thread through deltas and turn ends, and its failed turn
+    /// marks the card failed.
+    #[test]
+    fn subagent_deltas_and_failure() {
+        let mut st = CodexState::new(launch());
+        st.thread = Some("parent".into());
+        st.on_message(&json!({"jsonrpc": "2.0", "method": "item/completed", "params": {"threadId": "parent", "item": spawn_item("sp1", "completed", &["kid"], json!({}))}}));
+        let out = st.on_message(&json!({"jsonrpc": "2.0", "method": "item/commandExecution/outputDelta", "params": {"threadId": "kid", "itemId": "c1", "delta": "x"}}));
+        assert!(matches!(&out.events[0], AdapterEvent::Delta { thread: Some(t), field: DeltaField::Output, .. } if t == "kid"));
+        st.on_message(&json!({"jsonrpc": "2.0", "method": "item/started", "params": {"threadId": "kid", "item": {"type": "commandExecution", "id": "c1", "command": "sleep 9", "status": "inProgress"}}}));
+        let out = st.on_message(&json!({"jsonrpc": "2.0", "method": "turn/completed", "params": {"threadId": "kid", "turn": {"id": "tk", "status": "failed", "error": {"message": "boom"}}}}));
+        let items = final_items(&out.events);
+        assert!(items.iter().any(|i| i.kind == ChatItemKind::Error && i.thread.as_deref() == Some("kid")));
+        assert!(items.iter().any(|i| i.id == "c1" && i.thread.as_deref() == Some("kid") && i.status == ItemStatus::Completed));
+        let card = items.iter().find(|i| i.kind == ChatItemKind::Subagent).unwrap();
+        assert_eq!(card.subagent.as_ref().unwrap().status, SubagentStatus::Failed);
+        assert_eq!(card.status, ItemStatus::Failed);
+        // The parent is untouched.
+        assert!(!out.events.iter().any(|e| matches!(e, AdapterEvent::Status { .. })));
+    }
+
+    /// Resuming a thread shows its sub-agent cards with their last state and fetches the
+    /// sub-agents' threads for their views. A card left running was cut off by the old
+    /// app-server.
+    #[test]
+    fn resume_replays_subagent_cards() {
+        let mut l = launch();
+        l.resume = Some("parent".into());
+        let mut st = CodexState::new(l);
+        st.thread = Some("parent".into());
+        let turns = vec![json!({"id": "t1", "items": [
+            {"type": "userMessage", "id": "u1", "content": [{"type": "text", "text": "go"}]},
+            spawn_item("sp1", "completed", &["kid1"], json!({"kid1": {"status": "pendingInit"}})),
+            spawn_item("sp2", "completed", &["kid2"], json!({"kid2": {"status": "pendingInit"}})),
+            {"type": "collabAgentToolCall", "id": "w1", "tool": "wait", "status": "completed", "senderThreadId": "parent", "receiverThreadIds": ["kid1"], "agentsStates": {"kid1": {"status": "completed", "message": "found it"}}},
+        ]})];
+        let mut out = Out::default();
+        st.replay(&turns, &mut out);
+        let items = final_items(&out.events);
+        let cards: Vec<&ChatItem> = items.iter().filter(|i| i.kind == ChatItemKind::Subagent).collect();
+        assert_eq!(cards.len(), 2);
+        let s1 = cards[0].subagent.as_ref().unwrap();
+        assert_eq!((s1.status, s1.reply.as_deref()), (SubagentStatus::Done, Some("found it")));
+        assert_eq!(cards[1].subagent.as_ref().unwrap().status, SubagentStatus::Interrupted);
+        let lists: Vec<&Value> = out.to_agent.iter().filter(|m| m["method"] == "thread/turns/list").collect();
+        assert_eq!(lists.len(), 2);
+        // Their answer lands in the sub-agent's thread.
+        let id = lists[0]["id"].clone();
+        let tid = lists[0]["params"]["threadId"].as_str().unwrap().to_string();
+        let out = st.on_message(&json!({"id": id, "result": {"data": [{"id": "tk", "items": [{"type": "agentMessage", "id": "m9", "text": "hi"}]}]}}));
+        let items = final_items(&out.events);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].thread.as_deref(), Some(tid.as_str()));
     }
 }

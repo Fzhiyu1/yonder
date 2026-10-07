@@ -175,7 +175,9 @@ await ctx.addInitScript(() => {
 });
 const page = await ctx.newPage();
 page.on('pageerror', (e) => report.errors.push(String(e)));
-page.on('console', (m) => m.type() === 'error' && report.errors.push(m.text()));
+// WebKit 26 logs the viewport meta's `interactive-widget` (a Chromium key) as a console error.
+const BENIGN = /Viewport argument key "interactive-widget" not recognized/;
+page.on('console', (m) => m.type() === 'error' && !BENIGN.test(m.text()) && report.errors.push(m.text()));
 // A fresh document per flow (a hash-only goto would keep the mock state of the last flow).
 const go = async (hash) => {
   await page.goto('about:blank');
@@ -467,6 +469,71 @@ try {
     await page.waitForSelector('text=部署中继到 relay-1');
     note(`chip: ${(await page.getByRole('button', { name: /^审批模式/ }).getAttribute('aria-label').catch(() => 'missing')) ?? 'missing'}`);
     await audit(page, 'h1-claude-yolo');
+  }
+
+  // I. Sub-agents: a finished card opens its read-only thread; a running one asks for approval,
+  // answered from its thread view, and the card follows live.
+  await go(`#/h/${MAC}/s/s_chat_relay`);
+  {
+    const { tap, note, f } = flow('subagent-view');
+    const card = page.getByRole('button', { name: '查看子智能体 Linnaeus' });
+    await card.waitFor();
+    await card.scrollIntoViewIfNeeded();
+    await page.waitForTimeout(300);
+    await audit(page, 'i1-subagent-card');
+    const cardText = await card.innerText();
+    note(`card: ${cardText.replace(/\s+/g, ' ')}`);
+    check(cardText.includes('已关闭') && cardText.includes('gpt-5.5-mini'), 'subagent-view: card misses status or model');
+    check((await page.getByRole('main').getByText('先看 RelayLink 的生命周期').count()) === 0, 'subagent-view: sub-agent items leak into the chat');
+    await tap(page.getByRole('main').getByRole('button', { name: /^回复/ }).first());
+    await page.waitForTimeout(200);
+    check((await page.getByText('建议回到前台时发一次 ping').count()) > 0, 'subagent-view: folded reply does not open');
+    await tap(card);
+    const panel = page.getByRole('region', { name: '子智能体' });
+    await panel.waitFor();
+    await panel.getByText('rg -n "onclose|visibilitychange|ping" web/src/net').first().waitFor().catch(() => undefined);
+    await page.waitForTimeout(400);
+    await audit(page, 'i2-subagent-thread');
+    const shown = await panel.innerText();
+    check(shown.includes('Linnaeus') && shown.includes('找出锁屏恢复后不会触发重连的路径'), 'subagent-view: thread misses its task');
+    check(!(await panel.getByRole('textbox').count()), 'subagent-view: thread has an input');
+    note(`taps to read the sub-agent from its chat: ${f.taps}`);
+    await tap(panel.getByRole('button', { name: '返回对话' }));
+    await page.waitForTimeout(300);
+    check(!(await page.getByRole('region', { name: '子智能体' }).count()), 'subagent-view: back does not close the thread');
+  }
+
+  await go(`#/h/${LINUX}/s/s_chat_deploy`);
+  {
+    const { tap, note, f } = flow('subagent-approval');
+    await page.waitForSelector('text=部署中继到 relay-1');
+    const approvalCard = page.getByText('子智能体 检查 nginx 反代配置').first();
+    await approvalCard.waitFor();
+    note(`approval attributed: ${await place(page, approvalCard)}`);
+    await audit(page, 'i3-subagent-approval-chat');
+    await tap(page.getByRole('button', { name: '查看子智能体 检查 nginx 反代配置' }));
+    const panel = page.getByRole('region', { name: '子智能体' });
+    await panel.waitFor();
+    await panel.getByText('sudo nginx -T').first().waitFor();
+    await page.waitForTimeout(400);
+    const allow = panel.getByRole('button', { name: '允许', exact: true });
+    const allowPlace = await place(page, allow);
+    note(`allow in thread view: ${allowPlace}`);
+    check(allowPlace === 'visible', 'subagent-approval: allow button not visible in the thread view');
+    await audit(page, 'i4-subagent-thread-approval');
+    await tap(allow);
+    await panel.getByText('满足要求').first().waitFor({ timeout: 8000 });
+    await page.waitForTimeout(300);
+    const status = await panel.locator('span', { hasText: /^已完成$/ }).count();
+    check(status > 0, 'subagent-approval: thread view status did not become done');
+    check(!(await panel.getByRole('button', { name: '允许', exact: true }).count()), 'subagent-approval: approval still shown');
+    await audit(page, 'i5-subagent-thread-done');
+    await tap(panel.getByRole('button', { name: '返回对话' }));
+    await page.waitForTimeout(300);
+    const cardText = await page.getByRole('button', { name: '查看子智能体 检查 nginx 反代配置' }).innerText();
+    check(cardText.includes('已完成'), 'subagent-approval: card did not follow');
+    await audit(page, 'i6-subagent-card-done');
+    note(`taps from chat to answered: ${f.taps}`);
   }
 } catch (err) {
   report.errors.push(`probe: ${err.stack ?? err}`);

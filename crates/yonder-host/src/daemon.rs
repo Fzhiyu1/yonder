@@ -545,6 +545,12 @@ impl Daemon {
                 let (items, more) = self.sessions.chat_older(&session, &before, limit)?;
                 Ok(Response::ChatOlder { items, more })
             }
+            ChatThread { session, thread, before, limit } => {
+                need(PERM_SESSIONS)?;
+                let limit = limit.unwrap_or(crate::chatlog::THREAD_PAGE as u32).clamp(1, crate::chatlog::THREAD_PAGE_MAX as u32) as usize;
+                let (items, more, seq) = self.sessions.chat_thread(&session, &thread, before.as_deref(), limit).await?;
+                Ok(Response::ChatThread { items, more, seq })
+            }
             AgentPreview { agent, id } => {
                 need(PERM_SESSIONS)?;
                 let (items, truncated) = tokio::time::timeout(Duration::from_secs(30), yonder_agents::agent_preview(agent, &id))

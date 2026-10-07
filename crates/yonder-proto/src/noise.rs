@@ -40,6 +40,10 @@ pub struct DeviceHello {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub pair_token: Option<String>,
+    /// Optional capabilities understood by this client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub features: Option<Vec<String>>,
 }
 
 /// Sent by the host inside handshake message 2 (encrypted).
@@ -59,6 +63,10 @@ pub struct HostHello {
     pub version: String,
     /// Permissions granted to this device: `sessions`, `files`.
     pub permissions: Vec<String>,
+    /// Optional capabilities supported by this host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub features: Option<Vec<String>>,
 }
 
 fn builder<'a>() -> Result<snow::Builder<'a>> {
@@ -222,6 +230,7 @@ mod tests {
                 device_name: "test".into(),
                 client: "cli".into(),
                 pair_token: Some("tok".into()),
+                features: None,
             })
             .unwrap();
         let mut resp = Responder::new(&host).unwrap();
@@ -277,5 +286,19 @@ mod tests {
         let last = f.len() - 1;
         f[last] ^= 1;
         assert!(hc.decrypt(&f).is_err());
+    }
+
+    #[test]
+    fn old_hello_defaults_to_no_features() {
+        let old_device: DeviceHello = serde_json::from_str(
+            r#"{"protocol":1,"device_name":"old","client":"web"}"#,
+        )
+        .unwrap();
+        assert!(old_device.features.is_none());
+        let old_host: HostHello = serde_json::from_str(
+            r#"{"protocol":1,"ok":true,"host_name":"old","os":"linux","version":"0.1.0","permissions":[]}"#,
+        )
+        .unwrap();
+        assert!(old_host.features.is_none());
     }
 }

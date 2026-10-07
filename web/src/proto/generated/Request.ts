@@ -3,15 +3,23 @@ import type { AgentKind } from "./AgentKind";
 import type { ApprovalMode } from "./ApprovalMode";
 import type { SessionSpec } from "./SessionSpec";
 
-export type Request = { "op": "ping" } | { "op": "host_info" } | { "op": "list_sessions" } | { "op": "create_session", spec: SessionSpec, } | { "op": "attach", session: string, since?: number, } | { "op": "detach", session: string, } | { "op": "chat_older", session: string, before: string, 
+export type Request = { "op": "ping" } | { "op": "host_info" } | { "op": "list_sessions" } | { "op": "create_session", spec: SessionSpec, } | { "op": "attach", session: string, since?: number, } | { "op": "detach", session: string, } | { "op": "chat_thread", session: string,
+/**
+ * `Subagent::id` of the card.
+ */
+thread: string, before?: string,
+/**
+ * Page size (default 200, max 500).
+ */
+limit?: number, } | { "op": "chat_older", session: string, before: string,
 /**
  * Page size (default 40, max 200).
  */
-limit?: number, } | { "op": "kill", session: string, } | { "op": "remove", session: string, } | { "op": "rename", session: string, title: string, } | { "op": "continue_as_chat", session: string, } | { "op": "chat_send", session: string, text: string, attachments: Array<string>, } | { "op": "chat_interrupt", session: string, } | { "op": "approval_respond", session: string, approval: string, option: string, } | { "op": "set_chat_model", session: string, model: string, } | { "op": "http_fetch", url: string, } | { "op": "tailnet_url", url: string, } | { "op": "set_approval_mode", session: string, mode: ApprovalMode, } | { "op": "agent_history", 
+limit?: number, } | { "op": "kill", session: string, } | { "op": "remove", session: string, } | { "op": "rename", session: string, title: string, } | { "op": "continue_as_chat", session: string, } | { "op": "chat_send", session: string, text: string, attachments: Array<string>, } | { "op": "chat_interrupt", session: string, } | { "op": "approval_respond", session: string, approval: string, option: string, } | { "op": "set_chat_model", session: string, model: string, } | { "op": "http_fetch", url: string, } | { "op": "tailnet_url", url: string, } | { "op": "set_approval_mode", session: string, mode: ApprovalMode, } | { "op": "agent_history",
 /**
  * One agent, or every chat-capable agent on the host when absent.
  */
-agent?: AgentKind, cwd?: string, query?: string, cursor?: string, 
+agent?: AgentKind, cwd?: string, query?: string, cursor?: string,
 /**
  * Page size (default 50, max 200).
  */

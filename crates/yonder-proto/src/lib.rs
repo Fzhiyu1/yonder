@@ -15,6 +15,8 @@ pub mod relay;
 
 /// Protocol version exchanged in relay hello and app hello.
 pub const PROTOCOL_VERSION: u32 = 1;
+/// Optional application capabilities exchanged inside the Noise handshake.
+pub const FEATURE_SUBAGENTS: &str = "subagents";
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

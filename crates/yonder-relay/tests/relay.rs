@@ -126,7 +126,15 @@ async fn end_to_end_noise_through_relay() {
 
     // Real Noise IK handshake through the relay.
     let mut ini = Initiator::new(&dev_kp, &host_kp.public).unwrap();
-    let m1 = ini.write_hello(&DeviceHello { protocol: 1, device_name: "t".into(), client: "cli".into(), pair_token: None }).unwrap();
+    let m1 = ini
+        .write_hello(&DeviceHello {
+            protocol: 1,
+            device_name: "t".into(),
+            client: "cli".into(),
+            pair_token: None,
+            features: None,
+        })
+        .unwrap();
     dev.send(Message::Binary(relay::encode_frame(link, &m1).into())).await.unwrap();
     let f = recv_bin(&mut host).await;
     let (l, payload) = relay::decode_frame(&f).unwrap();

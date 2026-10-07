@@ -16,11 +16,11 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
-use yonder_proto::app::{ClientMsg as AppClientMsg, HostMsg};
+use yonder_proto::app::{ApiError, ClientMsg as AppClientMsg, HostMsg};
 use yonder_proto::keys::PublicKey;
 use yonder_proto::noise::{HostHello, Responder};
 use yonder_proto::relay::{self, ClientMsg, Role, ServerMsg};
-use yonder_proto::PROTOCOL_VERSION;
+use yonder_proto::{FEATURE_SUBAGENTS, PROTOCOL_VERSION};
 
 use crate::daemon::{Caller, Daemon};
 use crate::sessions::ClientHandle;
@@ -331,6 +331,7 @@ async fn link_task(
         os: crate::util::os_name().to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         permissions: Vec::new(),
+        features: Some(vec![FEATURE_SUBAGENTS.into()]),
     };
     let auth: Result<Vec<String>, &str> = if remote != from {
         // The relay-authenticated key must be the Noise static key.
@@ -362,7 +363,8 @@ async fn link_task(
     d.touch_device(&remote);
 
     let caller = Caller::Device { key: remote, permissions };
-    let (client, mut rx) = ClientHandle::new(d.next_client_id());
+    let supports_subagents = hello.features.as_ref().is_some_and(|features| features.iter().any(|f| f == FEATURE_SUBAGENTS));
+    let (client, mut rx) = ClientHandle::new_with_features(d.next_client_id(), supports_subagents);
     d.sessions.add_client(client.clone());
     let channel = Arc::new(Mutex::new(channel));
 
@@ -412,6 +414,21 @@ async fn link_task(
                     Ok(m) => m,
                     Err(e) => {
                         tracing::debug!("bad app message: {e}");
+                        if let Ok(raw) = serde_json::from_slice::<serde_json::Value>(&plain) {
+                            let id = raw.get("id").and_then(|v| v.as_u64());
+                            if raw.get("t").and_then(|v| v.as_str()) == Some("req") {
+                                if let Some(id) = id {
+                                    let op = raw
+                                        .get("req")
+                                        .and_then(|v| v.get("op"))
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("unknown");
+                                    let _ = client
+                                        .send_async(HostMsg::err(id, ApiError::unsupported(format!("request '{op}' is not supported by this host"))))
+                                        .await;
+                                }
+                            }
+                        }
                         continue;
                     }
                 };
@@ -419,7 +436,7 @@ async fn link_task(
             }
             _ = revoked.changed() => {
                 if revoked.borrow().contains(&remote) {
-                    let _ = client.tx.send(HostMsg::event(yonder_proto::app::Event::Notice {
+                    let _ = client.send_async(HostMsg::event(yonder_proto::app::Event::Notice {
                         level: yonder_proto::app::NoticeLevel::Error,
                         message: "此设备已被撤销授权".into(),
                     })).await;
@@ -446,7 +463,7 @@ pub async fn dispatch(d: &Arc<Daemon>, caller: &Caller, client: &ClientHandle, m
             let client = client.clone();
             tokio::spawn(async move {
                 if let Some(res) = d.on_request(&caller, &client, id, req).await {
-                    let _ = client.tx.send(res).await;
+                    let _ = client.send_async(res).await;
                 }
             });
         }

@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { ChevronDown, ChevronRight, FileDiff, HelpCircle, KeyRound, SquareTerminal, Wrench } from 'lucide-react';
+import { Bot, ChevronDown, ChevronRight, FileDiff, HelpCircle, KeyRound, SquareTerminal, Wrench } from 'lucide-react';
 import type { Approval } from '../../proto/generated/Approval';
 import type { ApprovalOption } from '../../proto/generated/ApprovalOption';
 import { getConn } from '../../net/provider';
@@ -53,7 +53,16 @@ export function ApprovalCard({ host, session, approval }: { host: string; sessio
           <Icon size={15} />
         </span>
         <div className="min-w-0 flex-1">
-          <div className="text-[12px] text-muted">{KIND_LABEL[approval.kind] ?? '审批'}</div>
+          <div className="flex min-w-0 items-center gap-1 text-[12px] text-muted">
+            {approval.thread && (
+              <span className="inline-flex min-w-0 items-center gap-1 text-accent">
+                <Bot size={12} className="shrink-0" />
+                <span className="truncate">{approval.thread_name ? `子智能体 ${approval.thread_name}` : '子智能体'}</span>
+                <span className="text-faint">·</span>
+              </span>
+            )}
+            <span className="shrink-0">{KIND_LABEL[approval.kind] ?? '审批'}</span>
+          </div>
           <div className="text-[14px] font-medium break-words">{approval.title}</div>
         </div>
       </div>

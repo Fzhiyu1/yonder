@@ -27,13 +27,27 @@ const PAGE_OUTPUT: usize = 8 * 1024;
 const MAX_ITEM_OUTPUT: usize = 256 * 1024;
 /// Cap for text / diff inside snapshots.
 const SNAPSHOT_OUTPUT: usize = 32 * 1024;
+/// Items kept per sub-agent thread (oldest dropped beyond this).
+const MAX_THREAD_ITEMS: usize = 500;
+/// Sub-agent threads kept (the least recently updated is dropped beyond this).
+const MAX_THREADS: usize = 32;
+/// Default and maximum page of a sub-agent thread for `chat_thread`.
+pub const THREAD_PAGE: usize = 200;
+pub const THREAD_PAGE_MAX: usize = 500;
 
 /// One client-visible chat change.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "k", rename_all = "snake_case")]
 pub enum ChatEv {
     Item { item: ChatItem },
-    Delta { item: String, field: DeltaField, delta: String },
+    Delta {
+        item: String,
+        field: DeltaField,
+        delta: String,
+        /// The item belongs to this sub-agent thread.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread: Option<String>,
+    },
     Status {
         status: ChatStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -48,7 +62,7 @@ impl ChatEv {
     pub fn from_event(ev: &Event) -> Option<(String, u64, ChatEv)> {
         Some(match ev.clone() {
             Event::ChatItem { session, seq, item } => (session, seq, ChatEv::Item { item }),
-            Event::ChatDelta { session, seq, item, field, delta } => (session, seq, ChatEv::Delta { item, field, delta }),
+            Event::ChatDelta { session, seq, item, field, delta, thread } => (session, seq, ChatEv::Delta { item, field, delta, thread }),
             Event::ChatStatus { session, seq, status, detail } => (session, seq, ChatEv::Status { status, detail }),
             Event::ApprovalRequested { session, seq, approval } => (session, seq, ChatEv::ApprovalRequested { approval }),
             Event::ApprovalResolved { session, seq, approval, option } => {
@@ -62,7 +76,7 @@ impl ChatEv {
         let session = session.to_string();
         match self.clone() {
             ChatEv::Item { item } => Event::ChatItem { session, seq, item },
-            ChatEv::Delta { item, field, delta } => Event::ChatDelta { session, seq, item, field, delta },
+            ChatEv::Delta { item, field, delta, thread } => Event::ChatDelta { session, seq, item, field, delta, thread },
             ChatEv::Status { status, detail } => Event::ChatStatus { session, seq, status, detail },
             ChatEv::ApprovalRequested { approval } => Event::ApprovalRequested { session, seq, approval },
             ChatEv::ApprovalResolved { approval, option } => {
@@ -102,10 +116,42 @@ pub struct LogLine {
     pub meta: Option<ChatMeta>,
 }
 
+/// Items of one sub-agent's thread, in arrival order.
+#[derive(Debug, Clone, Default)]
+struct ThreadItems {
+    items: Vec<ChatItem>,
+    index: HashMap<String, usize>,
+    /// Seq of the last change (for dropping the least recently used thread).
+    seq: u64,
+}
+
+impl ThreadItems {
+    fn upsert(&mut self, item: ChatItem) -> usize {
+        if let Some(&i) = self.index.get(&item.id) {
+            self.items[i] = item;
+            return i;
+        }
+        self.index.insert(item.id.clone(), self.items.len());
+        self.items.push(item);
+        if self.items.len() > MAX_THREAD_ITEMS {
+            let drop = self.items.len() - MAX_THREAD_ITEMS + MAX_THREAD_ITEMS / 5;
+            self.items.drain(..drop);
+            self.index = self.items.iter().enumerate().map(|(i, it)| (it.id.clone(), i)).collect();
+        }
+        self.items.len() - 1
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ChatState {
     items: Vec<ChatItem>,
     index: HashMap<String, usize>,
+    /// Sub-agent threads: items with `ChatItem::thread` set, kept apart from the chat's own.
+    /// Complete in the supervisor and in a state loaded from the log.
+    threads: HashMap<String, ThreadItems>,
+    /// Keep sub-agent threads. The daemon's copies do not: it asks the supervisor or reads the
+    /// log for them.
+    keep_threads: bool,
     pub approvals: Vec<Approval>,
     pub status: ChatStatus,
     pub detail: Option<String>,
@@ -127,6 +173,8 @@ impl Default for ChatState {
         Self {
             items: Vec::new(),
             index: HashMap::new(),
+            threads: HashMap::new(),
+            keep_threads: true,
             approvals: Vec::new(),
             status: ChatStatus::Starting,
             detail: None,
@@ -186,7 +234,7 @@ impl ChatState {
 
     /// State equivalent to a snapshot (what a client holds after `attached`).
     pub fn from_snapshot(snap: &ChatSnapshot) -> Self {
-        let mut st = ChatState::default();
+        let mut st = ChatState::default().without_threads();
         for item in &snap.items {
             st.upsert(item.clone());
         }
@@ -197,11 +245,36 @@ impl ChatState {
         st
     }
 
+    /// This state no longer keeps sub-agent threads (see `keep_threads`).
+    pub fn without_threads(mut self) -> Self {
+        self.threads.clear();
+        self.keep_threads = false;
+        self
+    }
+
     fn reindex(&mut self) {
         self.index = self.items.iter().enumerate().map(|(i, it)| (it.id.clone(), i)).collect();
     }
 
+    fn thread_mut(&mut self, thread: &str) -> &mut ThreadItems {
+        if !self.threads.contains_key(thread) && self.threads.len() >= MAX_THREADS {
+            if let Some(oldest) = self.threads.iter().min_by_key(|(_, t)| t.seq).map(|(k, _)| k.clone()) {
+                self.threads.remove(&oldest);
+            }
+        }
+        let seq = self.seq;
+        let t = self.threads.entry(thread.to_string()).or_default();
+        t.seq = seq;
+        t
+    }
+
     fn upsert(&mut self, item: ChatItem) {
+        if let Some(thread) = item.thread.clone() {
+            if self.keep_threads {
+                self.thread_mut(&thread).upsert(item);
+            }
+            return;
+        }
         if item.kind == ChatItemKind::Agent {
             if let Some(t) = item.text.as_ref().filter(|t| !t.trim().is_empty()) {
                 self.last_agent_text = Some(t.clone());
@@ -232,7 +305,27 @@ impl ChatState {
         self.seq = seq;
         match ev {
             ChatEv::Item { item } => self.upsert(item.clone()),
-            ChatEv::Delta { item, field, delta } => {
+            ChatEv::Delta { thread: Some(_), .. } if !self.keep_threads => {}
+            ChatEv::Delta { item, field, delta, thread: Some(thread) } => {
+                let t = self.thread_mut(thread);
+                let idx = match t.index.get(item) {
+                    Some(&i) => i,
+                    None => {
+                        let kind = if *field == DeltaField::Output { ChatItemKind::Command } else { ChatItemKind::Agent };
+                        let mut it = ChatItem::new(item.clone(), kind, ItemStatus::InProgress, yonder_proto::app::now_ms());
+                        it.thread = Some(thread.clone());
+                        t.upsert(it)
+                    }
+                };
+                let it = &mut t.items[idx];
+                let target = match field {
+                    DeltaField::Text => it.text.get_or_insert_with(String::new),
+                    DeltaField::Output => it.output.get_or_insert_with(String::new),
+                };
+                target.push_str(delta);
+                truncate_tail(target, MAX_ITEM_OUTPUT);
+            }
+            ChatEv::Delta { item, field, delta, thread: None } => {
                 let idx = match self.index.get(item) {
                     Some(&i) => i,
                     None => {
@@ -319,6 +412,23 @@ impl ChatState {
         Some((items, more))
     }
 
+    /// Up to `limit` items of a sub-agent thread, oldest first: the newest ones, or those right
+    /// before `before`. Also whether older ones can be fetched (items dropped from memory
+    /// cannot). Unknown thread: nothing.
+    pub fn thread_page(&self, thread: &str, before: Option<&str>, limit: usize) -> (Vec<ChatItem>, bool) {
+        let Some(t) = self.threads.get(thread) else { return (Vec::new(), false) };
+        let end = match before {
+            Some(b) => match t.index.get(b) {
+                Some(&i) => i,
+                None => return (Vec::new(), false),
+            },
+            None => t.items.len(),
+        };
+        let start = end.saturating_sub(limit);
+        let items = t.items[start..end].iter().map(|it| clip_item(it, PAGE_OUTPUT)).collect();
+        (items, start > 0)
+    }
+
     /// Short text for session lists.
     pub fn preview(&self) -> Option<String> {
         if let Some(a) = self.approvals.last() {
@@ -399,11 +509,13 @@ mod tests {
             options: vec![ApprovalOption { id: "allow".into(), label: "Allow".into(), kind: OptionKind::Allow }],
             item: None,
             ts: 1,
+            thread: None,
+            thread_name: None,
         };
         let evs = [
             ChatEv::Status { status: ChatStatus::Working, detail: None },
-            ChatEv::Delta { item: "m1".into(), field: DeltaField::Text, delta: "hel".into() },
-            ChatEv::Delta { item: "m1".into(), field: DeltaField::Text, delta: "lo".into() },
+            ChatEv::Delta { item: "m1".into(), field: DeltaField::Text, delta: "hel".into(), thread: None },
+            ChatEv::Delta { item: "m1".into(), field: DeltaField::Text, delta: "lo".into(), thread: None },
             ChatEv::ApprovalRequested { approval: approval.clone() },
             ChatEv::ApprovalResolved { approval: "a1".into(), option: "allow".into() },
             ChatEv::ApprovalRequested { approval },
@@ -449,8 +561,8 @@ mod tests {
         assert!(st.truncated);
         assert_eq!(st.snapshot().items.len(), SNAPSHOT_ITEMS);
         let big = "y".repeat(MAX_ITEM_OUTPUT);
-        st.apply(5000, &ChatEv::Delta { item: "c".into(), field: DeltaField::Output, delta: big.clone() });
-        st.apply(5001, &ChatEv::Delta { item: "c".into(), field: DeltaField::Output, delta: big });
+        st.apply(5000, &ChatEv::Delta { item: "c".into(), field: DeltaField::Output, delta: big.clone(), thread: None });
+        st.apply(5001, &ChatEv::Delta { item: "c".into(), field: DeltaField::Output, delta: big, thread: None });
         let c = st.items().iter().find(|i| i.id == "c").unwrap();
         assert!(c.output.as_ref().unwrap().len() <= MAX_ITEM_OUTPUT + 64);
         assert_eq!(c.kind, ChatItemKind::Command);
@@ -478,5 +590,88 @@ mod tests {
         // A copy that starts mid-chat sends callers to the log for what it lacks.
         let copy = ChatState::from_snapshot(&page);
         assert!(copy.older(&page.items[0].id, 10).is_none());
+    }
+
+    fn in_thread(mut it: ChatItem, thread: &str) -> ChatItem {
+        it.thread = Some(thread.into());
+        it
+    }
+
+    #[test]
+    fn subagent_threads_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = EventLog::open(dir.path()).unwrap();
+        let mut st = ChatState::default();
+        let mut card = ChatItem::new("card", ChatItemKind::Subagent, ItemStatus::InProgress, 1);
+        card.subagent = Some(yonder_proto::app::Subagent {
+            id: "kid".into(),
+            name: Some("Ada".into()),
+            role: None,
+            model: None,
+            status: yonder_proto::app::SubagentStatus::Running,
+            reply: None,
+        });
+        let evs = [
+            ChatEv::Item { item: agent_item("a1", "parent says") },
+            ChatEv::Item { item: card },
+            ChatEv::Item { item: in_thread(agent_item("k1", "kid says"), "kid") },
+            ChatEv::Delta { item: "k2".into(), field: DeltaField::Output, delta: "out".into(), thread: Some("kid".into()) },
+            ChatEv::Delta { item: "k2".into(), field: DeltaField::Output, delta: "put".into(), thread: Some("kid".into()) },
+            ChatEv::Item { item: in_thread(agent_item("o1", "other"), "other") },
+        ];
+        for (i, ev) in evs.iter().enumerate() {
+            st.apply(i as u64 + 1, ev);
+            log.append(&LogLine { seq: Some(i as u64 + 1), ts: 1, ev: Some(ev.clone()), meta: None });
+        }
+        log.flush();
+        // The chat shows its own items and the card; previews ignore sub-agents.
+        let ids: Vec<String> = st.page().items.iter().map(|i| i.id.clone()).collect();
+        assert_eq!(ids, ["a1", "card"]);
+        assert_eq!(st.preview().as_deref(), Some("parent says"));
+        let (items, more) = st.thread_page("kid", None, 10);
+        assert!(!more);
+        assert_eq!(items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(), ["k1", "k2"]);
+        assert_eq!(items[1].output.as_deref(), Some("output"));
+        assert_eq!(items[1].thread.as_deref(), Some("kid"));
+        assert_eq!(items[1].kind, ChatItemKind::Command);
+        assert!(st.thread_page("nope", None, 10).0.is_empty());
+        // Paging backwards.
+        let (items, more) = st.thread_page("kid", None, 1);
+        assert_eq!((items[0].id.as_str(), more), ("k2", true));
+        let (items, more) = st.thread_page("kid", Some("k2"), 1);
+        assert_eq!((items[0].id.as_str(), more), ("k1", false));
+        // The log has the threads too.
+        let back = ChatState::load(dir.path());
+        assert_eq!(back.thread_page("kid", None, 10).0.len(), 2);
+        // A copy without threads ignores them.
+        let mut copy = ChatState::from_snapshot(&st.snapshot());
+        copy.apply(7, &ChatEv::Item { item: in_thread(agent_item("k3", "more"), "kid") });
+        copy.apply(8, &ChatEv::Delta { item: "k4".into(), field: DeltaField::Text, delta: "x".into(), thread: Some("kid".into()) });
+        assert!(copy.thread_page("kid", None, 10).0.is_empty());
+        assert_eq!(copy.items().len(), 2);
+        assert_eq!(copy.seq, 8);
+    }
+
+    #[test]
+    fn thread_caps() {
+        let mut st = ChatState::default();
+        let mut seq = 0;
+        for i in 0..(MAX_THREAD_ITEMS + 10) {
+            seq += 1;
+            st.apply(seq, &ChatEv::Item { item: in_thread(agent_item(&format!("k{i}"), "x"), "kid") });
+        }
+        let (items, more) = st.thread_page("kid", None, THREAD_PAGE_MAX);
+        assert!(items.len() <= MAX_THREAD_ITEMS);
+        // Dropped items cannot be fetched: no promise of more beyond what is kept.
+        let (rest, _) = st.thread_page("kid", Some(&items[0].id), 10);
+        assert!(rest.is_empty() && !more);
+        for t in 0..(MAX_THREADS + 5) {
+            seq += 1;
+            st.apply(seq, &ChatEv::Item { item: in_thread(agent_item("x", "x"), &format!("t{t}")) });
+        }
+        assert!(st.threads.len() <= MAX_THREADS);
+        // The least recently updated thread went first.
+        assert!(st.thread_page("kid", None, 1).0.is_empty());
+        assert!(!st.thread_page(&format!("t{}", MAX_THREADS + 4), None, 1).0.is_empty());
     }
 }

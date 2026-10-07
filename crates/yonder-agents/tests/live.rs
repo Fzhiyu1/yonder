@@ -332,3 +332,29 @@ async fn codex_idle_release_frees_the_thread() {
 fn dirs_home() -> std::path::PathBuf {
     std::path::PathBuf::from(std::env::var("HOME").unwrap())
 }
+
+/// Sub-agent threads never show in history, not even with `all` (set `YONDER_LIVE_CHILDREN` to
+/// child thread / session ids recorded on this machine).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn live_history_hides_subagents() {
+    use yonder_agents::{list_history, HistoryQuery};
+    let children: Vec<String> = std::env::var("YONDER_LIVE_CHILDREN").unwrap_or_default().split(',').filter(|s| !s.is_empty()).map(str::to_string).collect();
+    for agent in [AgentKind::Codex, AgentKind::Claude] {
+        let mut cursor = None;
+        let mut n = 0;
+        loop {
+            let p = list_history(&HistoryQuery { agent: Some(agent), limit: Some(200), all: true, cursor: cursor.clone(), ..Default::default() }).await;
+            for s in &p.sessions {
+                assert!(!children.contains(&s.id), "{agent:?} lists sub-agent {}", s.id);
+                assert!(!s.title.starts_with("Run the shell command: touch"), "{agent:?} lists a sub-agent prompt: {} {}", s.id, s.title);
+            }
+            n += p.sessions.len();
+            cursor = p.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        println!("{agent:?}: {n} sessions, none of them sub-agents");
+    }
+}

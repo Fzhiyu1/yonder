@@ -1,6 +1,6 @@
 //! Helpers shared by adapters.
 
-use yonder_proto::app::{ChatItem, ChatItemKind, ItemStatus};
+use yonder_proto::app::{ChatItem, ChatItemKind, ItemStatus, Subagent, SubagentStatus};
 
 pub use yonder_proto::app::now_ms;
 
@@ -20,6 +20,36 @@ pub const MAX_OUTPUT: usize = 64 * 1024;
 
 pub fn item(id: impl Into<String>, kind: ChatItemKind, status: ItemStatus) -> ChatItem {
     ChatItem::new(id, kind, status, now_ms())
+}
+
+/// A new sub-agent card (`kind == subagent`) for the agent whose thread is `thread` (empty
+/// until the agent exists).
+pub fn subagent_card(id: impl Into<String>, thread: impl Into<String>, status: SubagentStatus) -> ChatItem {
+    let mut it = item(id, ChatItemKind::Subagent, ItemStatus::InProgress);
+    it.subagent = Some(Subagent { id: thread.into(), name: None, role: None, model: None, status, reply: None });
+    set_subagent_status(&mut it, status);
+    it
+}
+
+/// Sets a card's sub-agent status and the item status that goes with it. Returns whether
+/// anything changed.
+pub fn set_subagent_status(it: &mut ChatItem, status: SubagentStatus) -> bool {
+    let item_status = match status {
+        SubagentStatus::Running => ItemStatus::InProgress,
+        SubagentStatus::Done | SubagentStatus::Closed => ItemStatus::Completed,
+        SubagentStatus::Interrupted => ItemStatus::Declined,
+        SubagentStatus::Failed => ItemStatus::Failed,
+    };
+    let Some(sub) = it.subagent.as_mut() else { return false };
+    let changed = sub.status != status || it.status != item_status;
+    sub.status = status;
+    it.status = item_status;
+    changed
+}
+
+/// The card's agent is still running.
+pub fn subagent_active(it: &ChatItem) -> bool {
+    it.subagent.as_ref().is_some_and(|s| s.status == SubagentStatus::Running)
 }
 
 pub fn random_id() -> String {

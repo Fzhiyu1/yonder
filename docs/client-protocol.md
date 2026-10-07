@@ -46,10 +46,15 @@ Noise `IK_25519_ChaChaPoly_BLAKE2s`, prologue `yonder-e2e-v1`, device = initiato
 
 1. After `opened`, send handshake message 1 as a binary frame on the link:
    `new Handshake(keypair, host).writeHello(JSON DeviceHello)` with
-   `{protocol:1, device_name, client:"web"|"ios"|"cli", pair_token?}`.
+   `{protocol:1, device_name, client:"web"|"ios"|"cli", pair_token?, features?}`.
+   `features` is optional for backwards compatibility. The web client advertises
+   `["subagents"]`.
 2. The first binary frame back is message 2: `handshake.readResponse(bytes)` gives a
    `Channel`; `channel.hostHello()` is JSON `HostHello`
-   `{protocol, ok, error?, host_name, os, version, permissions}`.
+   `{protocol, ok, error?, host_name, os, version, permissions, features?}`.
+   A host advertises `subagents` when it can send sub-agent cards, thread-tagged chat events,
+   thread fields on approvals, and answer `chat_thread`. This capability is negotiated per
+   Noise link; `PROTOCOL_VERSION` remains `1`.
    If `ok` is false the host closes the link. `error` is one of `not_paired`,
    `pair_token_invalid`, `revoked`, `protocol_mismatch`, `relay_mismatch`.
 3. Afterwards every binary frame on the link is one Noise transport message.
@@ -90,6 +95,8 @@ Suggested request timeouts: 30 s; file operations 120 s. Request ids are per lin
 | `chat_send{session, text, attachments}` | `ok` | `attachments`: host paths from `upload_temp` (images) |
 | `chat_interrupt{session}` | `ok` | |
 | `approval_respond{session, approval, option}` | `ok` | `option` = `ApprovalOption.id` |
+| `chat_older{session, before, limit?}` | `chat_older{items, more}` | chat items before `before` (an item id the client has), oldest first |
+| `chat_thread{session, thread, before?, limit?}` | `chat_thread{items, more, seq}` | one sub-agent's thread (read-only view), oldest first; section 5 |
 | `set_approval_mode{session, mode}` | `session{session}` | `ask`/`auto`/`yolo`, Codex and Claude chats; when `approval_live` is false the host restarts the chat (resuming the agent session) and returns the new session |
 | `agent_history{agent?, cwd?, query?, cursor?, limit?, all}` | `agent_history{sessions, next_cursor?, folders, errors}` | the agents' own sessions on the host, newest first, paged (history view, resume picker); see ADR 0002 |
 | `agent_preview{agent, id}` | `agent_preview{items, truncated}` | last user messages and final agent replies of one agent session, read without starting it |
@@ -123,7 +130,8 @@ title, clients, chat status, pending approvals, approval mode, preview), `sessio
 
 Sent only to clients attached to the session: `pty_output`, `pty_snapshot`, `pty_resized`,
 `chat_item`, `chat_delta`, `chat_snapshot`, `chat_status`, `approval_requested`,
-`approval_resolved`.
+`approval_resolved`. `chat_item` / `chat_delta` with `thread` belong to a sub-agent's thread
+(section 5).
 
 ## 5. Attaching
 
@@ -157,7 +165,8 @@ ignore events with `seq <= current`; on a gap (`seq > current + 1`) re-attach.
   `item.output` (`field:"output"`). Unknown item: create an in-progress agent item.
 - `chat_status{status, detail?}`: `starting|idle|working|awaiting_approval|error|exited`.
 - `approval_requested{approval}` / `approval_resolved{approval, option}`.
-- `chat_snapshot{snapshot}`: replace everything (sent after the client fell behind).
+- `chat_snapshot{snapshot}`: replace everything (sent after the client fell behind). The
+  snapshot's `seq` is the authoritative session sequence.
 
 User messages are echoed back as `user` items; clients may show an optimistic bubble and
 drop it when the echo arrives. While the agent is `working`, `chat_send` queues or steers
@@ -165,6 +174,45 @@ drop it when the echo arrives. While the agent is `working`, `chat_send` queues 
 
 Approval options have `kind`: `allow`, `allow_always`, `deny`, `abort` (deny and stop the
 turn), `choice` (questions). Send the chosen `ApprovalOption.id`.
+
+### Sub-agents
+
+See docs/adr/0006-subagents.md. A sub-agent the agent spawned is one item of kind `subagent`
+in the chat: `item.subagent = {id, name?, role?, model?, status, reply?}` with `status`
+`running|done|failed|interrupted|closed`, and `item.text` its task. It is updated in place
+(`chat_item` with the same id) as the sub-agent runs; Codex `wait` / `close` calls produce no
+items of their own.
+
+Items of the sub-agent's own thread carry `thread` = `subagent.id`. They are never part of
+`attached.chat`, `chat_snapshot` or `chat_older`; live they arrive as `chat_item` /
+`chat_delta` (with `thread` set) and count for the session's seq like any event. A chat view
+must not show them (advance `seq`, drop the item). To show a sub-agent:
+
+1. `chat_thread{session, thread: subagent.id}` returns the newest page (`items` oldest first,
+   `more` = older items can be fetched with `before` = the oldest id) and the `seq` it reflects.
+2. Apply live `chat_item` / `chat_delta` events with that `thread` and a seq above the answer's
+   `seq`. Events that arrive while the request is in flight are applied on top of the answer.
+3. Track the whole session sequence separately from the last sequence reflected in the thread.
+   Parent-chat and other-thread events advance the session sequence even when they are not
+   displayed. Reload after a gap, `chat_snapshot`, or reconnect/reattach. The view is read-only:
+   there is no input to sub-agents.
+
+`Approval.thread` / `thread_name` say that a sub-agent raised the approval. It is answered
+with `approval_respond` like any other; it also sits in the chat's `approvals`.
+
+### Capability compatibility
+
+The protocol version stays at `1`; clients and hosts must treat `features` as an optional
+extension field. A client that does not advertise `subagents` receives no thread-tagged items
+or deltas and no sub-agent-only fields. Sub-agent cards are downgraded to ordinary `tool` items
+so an older renderer can keep the parent transcript usable. Approvals remain answerable, but
+their `thread` and `thread_name` fields are removed.
+
+A new client must check the host's `features` before sending `chat_thread`. If `subagents` is
+absent, it must show the host-too-old state immediately and must not wait for a request timeout.
+Hosts also return an `unsupported` response when a request cannot be decoded but contains a
+request id, so future extensions fail fast instead of silently hanging. The relay only carries
+encrypted Noise frames and never parses these application fields.
 
 ## 6. Files
 
