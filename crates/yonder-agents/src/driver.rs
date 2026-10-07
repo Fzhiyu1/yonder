@@ -58,6 +58,14 @@ pub trait Protocol: Send + 'static {
     fn can_release(&self) -> bool {
         false
     }
+    /// How often the driver should call [`Protocol::on_tick`] while the process is alive.
+    fn poll_interval(&self) -> Option<Duration> {
+        None
+    }
+    /// Periodic protocol work, such as recovering state that may have been lost upstream.
+    fn on_tick(&mut self) -> Out {
+        Out::default()
+    }
     /// The process was stopped for being idle.
     fn on_release(&mut self) -> Out {
         Out::default()
@@ -129,8 +137,10 @@ pub fn run<P: Protocol>(agent: AgentKind, launch: &AgentLaunch, argv: Vec<String
         let mut pid = first_pid;
         let mut alive = flush(&mut p.stdin, &ev_tx, proto.start()).await;
         let mut last = Instant::now();
+        let mut last_poll = Instant::now();
         'run: while alive {
             let deadline = proto.idle_release().filter(|_| proto.can_release()).map(|d| last + d);
+            let poll_deadline = proto.poll_interval().map(|d| last_poll + d);
             tokio::select! {
                 line = p.lines.recv() => match line {
                     Some(v) => {
@@ -145,6 +155,10 @@ pub fn run<P: Protocol>(agent: AgentKind, launch: &AgentLaunch, argv: Vec<String
                         last = Instant::now();
                         alive = flush(&mut p.stdin, &ev_tx, proto.on_cmd(c)).await;
                     }
+                },
+                _ = sleep_until(poll_deadline), if poll_deadline.is_some() => {
+                    last_poll = Instant::now();
+                    alive = flush(&mut p.stdin, &ev_tx, proto.on_tick()).await;
                 },
                 _ = sleep_until(deadline), if deadline.is_some() => {
                     if !proto.can_release() {

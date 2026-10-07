@@ -906,8 +906,8 @@ impl Protocol for ClaudeState {
                 if let Some(p) = self.approvals.remove(&approval_id) {
                     out.send(Self::respond(&p, &option_id));
                     out.event(AdapterEvent::ApprovalResolved { approval: approval_id, option: option_id });
-                    if self.approvals.is_empty() && self.busy {
-                        out.status(ChatStatus::Working, None);
+                    if self.approvals.is_empty() {
+                        out.status(if self.busy { ChatStatus::Working } else { ChatStatus::Idle }, None);
                     }
                 }
             }
@@ -929,8 +929,8 @@ impl Protocol for ClaudeState {
                         out.event(AdapterEvent::ApprovalResolved { approval: id, option: "allow".into() });
                     }
                 }
-                if self.approvals.is_empty() && self.busy {
-                    out.status(ChatStatus::Working, None);
+                if self.approvals.is_empty() {
+                    out.status(if self.busy { ChatStatus::Working } else { ChatStatus::Idle }, None);
                 }
             }
             AdapterCmd::SetModel(model) => {
@@ -1088,6 +1088,31 @@ pub(crate) mod tests {
         let out = st.on_cmd(AdapterCmd::Approve { approval_id: a.id.clone(), option_id: "deny".into() });
         assert_eq!(out.to_agent[0]["response"]["response"]["behavior"], "deny");
         assert!(out.to_agent[0]["response"]["response"]["message"].is_string());
+    }
+
+    #[test]
+    fn background_approval_returns_to_idle_after_parent_turn() {
+        let mut st = ClaudeState::new(launch());
+        st.initialized = true;
+        st.busy = false;
+        let out = st.on_message(&json!({
+            "type": "control_request",
+            "request_id": "child-approval",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "Bash",
+                "input": {"command": "ls"},
+                "tool_use_id": "child-tool"
+            }
+        }));
+        let approval = out.events.iter().find_map(|e| match e {
+            AdapterEvent::ApprovalRequested(a) => Some(a.clone()),
+            _ => None,
+        }).expect("approval");
+        assert!(out.events.iter().any(|e| matches!(e, AdapterEvent::Status { status: ChatStatus::AwaitingApproval, .. })));
+
+        let out = st.on_cmd(AdapterCmd::Approve { approval_id: approval.id, option_id: "allow".into() });
+        assert!(out.events.iter().any(|e| matches!(e, AdapterEvent::Status { status: ChatStatus::Idle, detail: None })));
     }
 
     #[test]

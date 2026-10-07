@@ -1,6 +1,7 @@
 //! Codex adapter: `codex app-server` (JSON-RPC 2.0, one JSON object per line).
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -19,6 +20,9 @@ pub fn spawn(launch: AgentLaunch) -> Result<AdapterHandle> {
     let st = CodexState::new(launch.clone());
     run(AgentKind::Codex, &launch, argv, st)
 }
+
+const SUBAGENT_RECOVERY_INTERVAL: Duration = Duration::from_secs(5);
+const SUBAGENT_RECOVERY_MAX_TICKS: u32 = 24;
 
 impl Protocol for CodexState {
     fn start(&mut self) -> Out {
@@ -71,10 +75,16 @@ impl Protocol for CodexState {
         self.thread.is_some()
             && !self.busy
             && self.approvals.is_empty()
-            && self.pending.is_empty()
+            && !self.pending.values().any(|p| !matches!(p, Pending::RecentTurns | Pending::SubRead(_) | Pending::SubTurns(_)))
             && self.queued.is_empty()
             && self.after_turn.is_empty()
             && !self.cards.values().any(subagent_active)
+    }
+    fn poll_interval(&self) -> Option<Duration> {
+        (!self.busy && self.cards.values().any(subagent_active)).then_some(SUBAGENT_RECOVERY_INTERVAL)
+    }
+    fn on_tick(&mut self) -> Out {
+        self.recover_subagents()
     }
     fn on_release(&mut self) -> Out {
         // The app-server is gone: everything it knew is reset; the thread id stays for resuming.
@@ -123,6 +133,8 @@ enum Pending {
     Steer(String, Vec<std::path::PathBuf>),
     /// `thread/read` of a sub-agent's thread (its nickname and role).
     SubRead(String),
+    /// Periodic recovery read of a child whose completion may have been lost.
+    SubProbe(String),
     /// `thread/turns/list` of a sub-agent's thread (history of a resumed chat).
     SubTurns(String),
     Other,
@@ -176,6 +188,8 @@ pub struct CodexState {
     subs: HashMap<String, String>,
     /// Sub-agent thread id -> its latest agent message (the card's reply when its turn ends).
     sub_text: HashMap<String, String>,
+    /// Number of recovery polls since the parent became idle.
+    sub_recovery_ticks: u32,
     pub exit_error: Option<String>,
 }
 
@@ -232,8 +246,56 @@ impl CodexState {
             cards: HashMap::new(),
             subs: HashMap::new(),
             sub_text: HashMap::new(),
+            sub_recovery_ticks: 0,
             exit_error: None,
         }
+    }
+
+    fn recover_subagents(&mut self) -> Out {
+        let mut out = Out::default();
+        if self.busy || !self.cards.values().any(subagent_active) {
+            self.sub_recovery_ticks = 0;
+            return out;
+        }
+        self.sub_recovery_ticks = self.sub_recovery_ticks.saturating_add(1);
+        let active: Vec<String> = self
+            .cards
+            .values()
+            .filter_map(|card| card.subagent.as_ref().filter(|sub| sub.status == SubagentStatus::Running).map(|sub| sub.id.clone()))
+            .filter(|tid| !tid.is_empty())
+            .collect();
+        if self.sub_recovery_ticks >= SUBAGENT_RECOVERY_MAX_TICKS {
+            for tid in active {
+                self.update_card(&tid, &mut out, |c| {
+                    c.status = SubagentStatus::Interrupted;
+                    if c.reply.is_none() {
+                        c.reply = Some("Sub-agent state could not be recovered.".into());
+                    }
+                });
+            }
+            let approvals: Vec<String> = self.approvals.keys().cloned().collect();
+            for id in approvals {
+                if let Some(p) = self.approvals.remove(&id) {
+                    out.to_agent.push(Self::decision(&p, "abort"));
+                    out.events.push(AdapterEvent::ApprovalResolved { approval: id, option: "cancelled".into() });
+                }
+            }
+            self.pending.retain(|_, p| !matches!(p, Pending::SubProbe(_)));
+            self.sub_recovery_ticks = 0;
+            out.status(ChatStatus::Idle, Some("Sub-agent state could not be recovered.".into()));
+            return out;
+        }
+        for tid in active {
+            if self.pending.values().any(|p| matches!(p, Pending::SubProbe(id) if id == &tid)) {
+                continue;
+            }
+            let m = self.request("thread/read", json!({"threadId": tid}));
+            if let Some(id) = m.get("id").and_then(|i| i.as_u64()) {
+                self.pending.insert(id, Pending::SubProbe(tid));
+            }
+            out.to_agent.push(m);
+        }
+        out
     }
 
     /// Status detail while a turn waits for MCP servers to start.
@@ -459,6 +521,15 @@ impl CodexState {
                     return;
                 }
             }
+            if let Pending::SubProbe(tid) = &kind {
+                self.update_card(tid, out, |c| {
+                    c.status = SubagentStatus::Interrupted;
+                    if c.reply.is_none() {
+                        c.reply = Some("Sub-agent state could not be recovered.".into());
+                    }
+                });
+                return;
+            }
             // History replay and sub-agent details are optional (older Codex has no
             // `thread/turns/list`; a sub-agent's thread may be gone).
             if matches!(kind, Pending::RecentTurns | Pending::SubRead(_) | Pending::SubTurns(_)) {
@@ -562,6 +633,24 @@ impl CodexState {
                 }
                 if *sub != before {
                     out.events.push(AdapterEvent::Item(card.clone()));
+                }
+            }
+            Pending::SubProbe(tid) => {
+                let status = result
+                    .get("thread")
+                    .and_then(|t| t.get("status"))
+                    .and_then(|s| s.get("type"))
+                    .and_then(Value::as_str);
+                match status {
+                    Some("idle") => self.update_card(&tid, out, |c| c.status = SubagentStatus::Done),
+                    Some("systemError") => self.update_card(&tid, out, |c| c.status = SubagentStatus::Failed),
+                    Some("notLoaded") | None => self.update_card(&tid, out, |c| {
+                        c.status = SubagentStatus::Interrupted;
+                        if c.reply.is_none() {
+                            c.reply = Some("Sub-agent state could not be recovered.".into());
+                        }
+                    }),
+                    _ => {}
                 }
             }
             Pending::SubTurns(tid) => {
@@ -880,6 +969,7 @@ impl CodexState {
         match method {
             "turn/started" => {
                 self.busy = true;
+                self.sub_recovery_ticks = 0;
                 if let Some(t) = p.get("turn").and_then(|t| s(t, "id")) {
                     self.turn = Some(t);
                 }
@@ -1771,6 +1861,58 @@ mod tests {
         let out = st.on_message(&json!({"jsonrpc": "2.0", "method": "turn/completed", "params": {"threadId": "kid", "turn": {"id": "tk", "status": "completed"}}}));
         let card = out.events.iter().find_map(|e| match e { AdapterEvent::Item(i) => Some(i.clone()), _ => None }).unwrap();
         assert_eq!(card.subagent.unwrap().status, SubagentStatus::Done);
+        assert!(st.can_release());
+    }
+
+    #[test]
+    fn idle_parent_probes_running_subagent_and_releases_after_completion() {
+        let mut st = CodexState::new(launch());
+        st.thread = Some("parent".into());
+        let out = st.on_message(&json!({
+            "jsonrpc": "2.0",
+            "method": "item/completed",
+            "params": {"threadId": "parent", "item": spawn_item("sp1", "completed", &["kid"], json!({"kid": {"status": "running"}}))}
+        }));
+        let read = out.to_agent.iter().find(|m| m["method"] == "thread/read").unwrap();
+        st.on_message(&json!({"id": read["id"].clone(), "result": {"thread": {"id": "kid"}}}));
+        assert!(!st.can_release());
+
+        let out = st.on_tick();
+        let probe = out.to_agent.iter().find(|m| m["method"] == "thread/read").expect("recovery probe");
+        let out = st.on_message(&json!({
+            "id": probe["id"].clone(),
+            "result": {"thread": {"id": "kid", "status": {"type": "idle"}}}
+        }));
+        assert!(out.events.iter().any(|e| matches!(e, AdapterEvent::Item(i)
+            if i.kind == ChatItemKind::Subagent && i.subagent.as_ref().is_some_and(|s| s.status == SubagentStatus::Done))));
+        assert!(st.can_release());
+    }
+
+    #[test]
+    fn idle_parent_bounds_lost_subagent_recovery() {
+        let mut st = CodexState::new(launch());
+        st.thread = Some("parent".into());
+        let out = st.on_message(&json!({
+            "jsonrpc": "2.0",
+            "method": "item/completed",
+            "params": {"threadId": "parent", "item": spawn_item("sp1", "completed", &["kid"], json!({"kid": {"status": "running"}}))}
+        }));
+        let read = out.to_agent.iter().find(|m| m["method"] == "thread/read").unwrap();
+        st.on_message(&json!({"id": read["id"].clone(), "result": {"thread": {"id": "kid"}}}));
+        let out = st.on_message(&json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "kid", "itemId": "c1", "command": "ls"}
+        }));
+        assert!(out.events.iter().any(|e| matches!(e, AdapterEvent::ApprovalRequested(_))));
+        st.sub_recovery_ticks = SUBAGENT_RECOVERY_MAX_TICKS - 1;
+
+        let out = st.on_tick();
+        assert!(out.events.iter().any(|e| matches!(e, AdapterEvent::Item(i)
+            if i.kind == ChatItemKind::Subagent && i.subagent.as_ref().is_some_and(|s| s.status == SubagentStatus::Interrupted))));
+        assert!(out.events.iter().any(|e| matches!(e, AdapterEvent::ApprovalResolved { option, .. } if option == "cancelled")));
+        assert!(out.events.iter().any(|e| matches!(e, AdapterEvent::Status { status: ChatStatus::Idle, .. })));
         assert!(st.can_release());
     }
 

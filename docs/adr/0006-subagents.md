@@ -55,18 +55,37 @@ sub-agent's work, and a parent status that does not lie.
    Approvals stay in the chat's single list (one place to answer, notifications unchanged apart
    from naming the sub-agent); the sub-agent's view shows its own pending ones too.
 5. **Parent status.** Sub-agent turns never touch the parent's turn or status (PR #7). Codex
-   keeps the app-server while any sub-agent runs (no idle release: it would kill them).
-   Answering a sub-agent approval after the parent's turn ended leaves the chat idle.
+   keeps the app-server while any sub-agent runs. When the parent is idle, the adapter probes
+   active child threads with `thread/read` every 5 seconds. A child that reports `idle` is
+   marked done; `systemError` is failed; a missing or not-loaded thread is interrupted. After
+   24 probes (two minutes), unresolved children are marked interrupted with an explicit
+   recovery note and the app-server may be released. This bound prevents one lost completion
+   event from keeping the app-server alive forever. Answering a sub-agent approval after the
+   parent's turn ended leaves the chat idle.
 6. **Sidebar and history.** Sub-agents are never sessions; history keeps hiding Codex threads
    with a parent and Claude sidechains.
+7. **Mixed-version capability negotiation.** `PROTOCOL_VERSION` remains `1`. `DeviceHello` and
+   `HostHello` carry optional `features`; the `subagents` capability is required for the new
+   thread event and request behavior. A host filters thread-tagged items/deltas and sub-agent
+   fields for clients that do not advertise it, downgrades cards to ordinary tool items, and
+   keeps approvals answerable without thread attribution. A new client does not call
+   `chat_thread` when the host does not advertise the capability and shows an immediate
+   host-too-old state. If an undecodable request includes an id, the host returns `unsupported`
+   so future extensions fail fast.
+8. **Thread resynchronization.** A thread view tracks the whole session sequence separately
+   from the last sequence reflected in its own items. Parent events advance the session
+   sequence even when they are not displayed in the thread. Gaps, `chat_snapshot`, and
+   reconnect/reattach trigger a fresh `chat_thread` load. Closed thread views are evicted from
+   the browser store.
 
 ## Consequences
 
 - The phone sees what sub-agents do and who is asking, at the cost of more events per chat
   (sub-agent reasoning and output now reach the supervisor log and attached clients).
-- `chat_thread` against a host without it fails with "unknown variant"; the client says the
-  host is too old. Old supervisors close the connection on the new IPC request; the daemon then
-  falls back to the log.
+- `chat_thread` is negotiated before use. A host without it is reported immediately by the
+  client; the request is not sent. Old supervisors may still close the connection on unknown
+  IPC requests, while the relay link returns `unsupported` when an undecodable request carries
+  a request id.
 - Claude does not stream the sub-agent's final message; it arrives with the Task result and is
   added to the thread then.
 - The relay sees nothing new: cards, threads and approvals travel inside the encrypted channel.
