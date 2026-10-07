@@ -588,7 +588,20 @@ impl CodexState {
         out.events.push(AdapterEvent::Status { status: ChatStatus::AwaitingApproval, detail: None });
     }
 
+    /// Sub-agents run in their own threads on the same app-server connection, so their turn
+    /// notifications arrive here too. Tracking those would replace this thread's turn id and
+    /// make `turn/interrupt` fail ("expected active turn id ... but found ...").
+    fn other_thread(&self, p: &Value) -> bool {
+        match (p.get("threadId").and_then(|t| t.as_str()), self.thread.as_deref()) {
+            (Some(t), Some(own)) => t != own,
+            _ => false,
+        }
+    }
+
     fn on_notification(&mut self, method: &str, p: Value, out: &mut Out) {
+        if method.starts_with("turn/") && self.other_thread(&p) {
+            return;
+        }
         match method {
             "turn/started" => {
                 self.busy = true;
@@ -1182,6 +1195,26 @@ mod tests {
         let out = st.on_message(&json!({"jsonrpc": "2.0", "method": "turn/completed", "params": {"turn": {"id": "turn-2", "status": "completed"}}}));
         let start = out.to_agent.iter().find(|m| m["method"] == "turn/start").expect("turn after");
         assert_eq!(start["params"]["input"][0]["text"], "three");
+    }
+
+    /// A sub-agent's turns arrive on the parent's connection: they must not replace the
+    /// parent's turn, end it, or be what Stop interrupts.
+    #[test]
+    fn sub_agent_turns_do_not_touch_the_parent_turn() {
+        let mut st = CodexState::new(launch());
+        st.thread = Some("parent".into());
+        st.on_message(&json!({"jsonrpc": "2.0", "method": "turn/started", "params": {"threadId": "parent", "turn": {"id": "turn-p"}}}));
+        st.on_message(&json!({"jsonrpc": "2.0", "method": "turn/started", "params": {"threadId": "child", "turn": {"id": "turn-c"}}}));
+        assert_eq!(st.turn.as_deref(), Some("turn-p"));
+
+        let out = st.on_message(&json!({"jsonrpc": "2.0", "method": "turn/completed", "params": {"threadId": "child", "turn": {"id": "turn-c", "status": "completed"}}}));
+        assert!(out.events.is_empty(), "{:?}", out.events);
+        assert!(st.busy);
+
+        let out = st.on_cmd(AdapterCmd::Interrupt);
+        assert_eq!(out.to_agent[0]["method"], "turn/interrupt");
+        assert_eq!(out.to_agent[0]["params"]["threadId"], "parent");
+        assert_eq!(out.to_agent[0]["params"]["turnId"], "turn-p");
     }
 
     /// A steer that loses the race with the end of its turn is sent as a new turn.
