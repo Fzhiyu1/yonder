@@ -13,7 +13,7 @@ use yonder_proto::app::{ClientMsg as AppClientMsg, Event, HostMsg, Request, Resp
 use yonder_proto::keys::{Keypair, PublicKey};
 use yonder_proto::noise::{DeviceHello, HostHello, Initiator};
 use yonder_proto::relay::{self, ClientMsg, Role, ServerMsg};
-use yonder_proto::PROTOCOL_VERSION;
+use yonder_proto::{FEATURE_SUBAGENTS, PROTOCOL_VERSION};
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<HostMsg>>>>;
 
@@ -71,6 +71,7 @@ impl DeviceClient {
             device_name: name.into(),
             client: "cli".into(),
             pair_token: pair_token.map(str::to_string),
+            features: Some(vec![FEATURE_SUBAGENTS.into()]),
         };
         let m1 = ini.write_hello(&hello)?;
         sink.send(Message::Binary(relay::encode_frame(link, &m1).into())).await?;

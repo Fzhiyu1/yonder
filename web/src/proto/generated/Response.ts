@@ -12,52 +12,52 @@ import type { PairPayload } from "./PairPayload";
 import type { SessionInfo } from "./SessionInfo";
 import type { TerminalSnapshot } from "./TerminalSnapshot";
 
-export type Response = { "kind": "pong", ts: number, } | { "kind": "host_info", info: HostInfo, } | { "kind": "sessions", sessions: Array<SessionInfo>, } | { "kind": "session", session: SessionInfo, } | { "kind": "attached", session: SessionInfo, terminal?: TerminalSnapshot, chat?: ChatSnapshot, } | { "kind": "agent_history", sessions: Array<AgentSessionSummary>, 
+export type Response = { "kind": "pong", ts: number, } | { "kind": "host_info", info: HostInfo, } | { "kind": "sessions", sessions: Array<SessionInfo>, } | { "kind": "session", session: SessionInfo, } | { "kind": "attached", session: SessionInfo, terminal?: TerminalSnapshot, chat?: ChatSnapshot, } | { "kind": "agent_history", sessions: Array<AgentSessionSummary>,
 /**
  * More sessions follow: pass this as `cursor`.
  */
-next_cursor?: string, 
+next_cursor?: string,
 /**
  * First page only: folders of the matching sessions (without `cwd` / `query`),
  * most recently used first.
  */
-folders: Array<HistoryFolder>, 
+folders: Array<HistoryFolder>,
 /**
  * Agents whose history could not be read (the others are still listed).
  */
-errors: Array<string>, } | { "kind": "chat_older", 
+errors: Array<string>, } | { "kind": "chat_older",
 /**
  * Oldest first.
  */
-items: Array<ChatItem>, 
+items: Array<ChatItem>,
 /**
  * Even older items exist.
  */
-more: boolean, } | { "kind": "chat_thread", 
+more: boolean, } | { "kind": "chat_thread",
 /**
  * Oldest first.
  */
-items: Array<ChatItem>, 
+items: Array<ChatItem>,
 /**
  * Even older items exist.
  */
-more: boolean, 
+more: boolean,
 /**
  * Seq of the last event reflected in `items`.
  */
-seq: number, } | { "kind": "http_response", status: number, 
+seq: number, } | { "kind": "http_response", status: number,
 /**
  * Response headers (lowercase names), e.g. `content-type`.
  */
-headers: Array<[string, string]>, 
+headers: Array<[string, string]>,
 /**
  * Body, base64.
  */
-data: string, } | { "kind": "tailnet_url", url: string, reachable: boolean, } | { "kind": "agent_preview", 
+data: string, } | { "kind": "tailnet_url", url: string, reachable: boolean, } | { "kind": "agent_preview",
 /**
  * Oldest first; user messages and the last agent message of each turn.
  */
-items: Array<ChatItem>, 
+items: Array<ChatItem>,
 /**
  * Earlier messages exist.
  */

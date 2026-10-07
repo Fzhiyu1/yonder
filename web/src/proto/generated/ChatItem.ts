@@ -3,33 +3,33 @@ import type { ChatItemKind } from "./ChatItemKind";
 import type { ItemStatus } from "./ItemStatus";
 import type { Subagent } from "./Subagent";
 
-export type ChatItem = { id: string, kind: ChatItemKind, status: ItemStatus, 
+export type ChatItem = { id: string, kind: ChatItemKind, status: ItemStatus,
 /**
  * Markdown for messages, reasoning, plans.
  */
-text?: string, 
+text?: string,
 /**
  * Command line, tool name, search query, file summary.
  */
-title?: string, 
+title?: string,
 /**
  * Command output or tool result (may be truncated by the host).
  */
-output?: string, 
+output?: string,
 /**
  * Unified diff for file changes.
  */
-diff?: string, 
+diff?: string,
 /**
  * Files touched, or image paths attached to a user message.
  */
-paths: Array<string>, exit_code?: number, duration_ms?: number, ts: number, 
+paths: Array<string>, exit_code?: number, duration_ms?: number, ts: number,
 /**
  * The item belongs to the thread of this sub-agent (`Subagent::id`), not to the chat
  * itself: it is only shown in the sub-agent's read-only view. Snapshots and
  * `chat_older` carry the chat's own items only; `chat_thread` reads a sub-agent's.
  */
-thread?: string, 
+thread?: string,
 /**
  * `kind == subagent`: the sub-agent this card stands for. `text` is its task (prompt).
  */

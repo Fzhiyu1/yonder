@@ -3,16 +3,20 @@
 /**
  * Sent by the device inside handshake message 1 (encrypted).
  */
-export type DeviceHello = { protocol: number, 
+export type DeviceHello = { protocol: number,
 /**
  * Human readable device name, e.g. "iPhone".
  */
-device_name: string, 
+device_name: string,
 /**
  * Client kind: "web", "ios", "cli".
  */
-client: string, 
+client: string,
 /**
  * One-time pairing token from the QR code. Present only on first contact.
  */
-pair_token?: string, };
+pair_token?: string,
+/**
+ * Optional capabilities understood by this client.
+ */
+features?: Array<string>, };

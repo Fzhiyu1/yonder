@@ -3,6 +3,7 @@ import type { ChatItem } from '../proto/generated/ChatItem';
 import type { ChatSnapshot } from '../proto/generated/ChatSnapshot';
 import type { ChatStatus } from '../proto/generated/ChatStatus';
 import type { Event } from '../proto/generated/Event';
+import { seqStep } from '../lib/chatSeq';
 
 export interface ChatState {
   /** Item ids in display order. */
@@ -101,8 +102,9 @@ function upsert(state: ChatState, item: ChatItem): Pick<ChatState, 'order' | 'by
 export function applyChatEvent(state: ChatState, event: ChatEvent): ApplyResult {
   if (event.ev === 'chat_snapshot') return { state: keepOlder(state, chatFromSnapshot(event.snapshot)), gap: false };
   if (!state.attached) return { state, gap: false };
-  if (event.seq <= state.seq) return { state, gap: false };
-  if (event.seq > state.seq + 1) return { state, gap: true };
+  const step = seqStep(state.seq, event.seq);
+  if (step === 'ignore') return { state, gap: false };
+  if (step === 'gap') return { state, gap: true };
   const seq = event.seq;
   if ((event.ev === 'chat_item' && event.item.thread) || (event.ev === 'chat_delta' && event.thread)) return { state: { ...state, seq }, gap: false };
   switch (event.ev) {

@@ -4,6 +4,11 @@ import type { Request } from '../proto/generated/Request';
 import type { Response } from '../proto/generated/Response';
 
 export type ConnStatus = 'offline' | 'connecting' | 'online' | 'error';
+export const FEATURE_SUBAGENTS = 'subagents';
+
+export function supportsFeature(conn: Pick<HostConnection, 'hostHello'>, feature: string): boolean {
+  return conn.hostHello?.features?.includes(feature) ?? false;
+}
 
 export interface RequestOptions {
   timeoutMs?: number;

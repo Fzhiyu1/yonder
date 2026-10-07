@@ -3,17 +3,21 @@
 /**
  * Sent by the host inside handshake message 2 (encrypted).
  */
-export type HostHello = { protocol: number, ok: boolean, 
+export type HostHello = { protocol: number, ok: boolean,
 /**
  * Machine-readable reason when `ok == false`: `not_paired`, `pair_token_invalid`,
  * `revoked`, `protocol_mismatch`.
  */
-error?: string, host_name: string, 
+error?: string, host_name: string,
 /**
  * `macos`, `linux`, `windows`.
  */
-os: string, version: string, 
+os: string, version: string,
 /**
  * Permissions granted to this device: `sessions`, `files`.
  */
-permissions: Array<string>, };
+permissions: Array<string>,
+/**
+ * Optional capabilities supported by this host.
+ */
+features?: Array<string>, };

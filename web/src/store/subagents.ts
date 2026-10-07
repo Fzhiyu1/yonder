@@ -1,7 +1,8 @@
 import { create } from 'zustand';
 import { getConn } from '../net/provider';
-import { call } from '../net/types';
-import { applyThreadEvent, prependThread, threadFromPage, type ThreadState } from '../lib/thread';
+import { call, FEATURE_SUBAGENTS, supportsFeature, type HostConnection } from '../net/types';
+import { applyThreadEventResult, prependThread, threadFromPage, type ThreadState } from '../lib/thread';
+import { isChatEvent, type ChatEvent } from './chatReducer';
 import { toastError } from './ui';
 
 export interface ThreadView extends Partial<ThreadState> {
@@ -29,7 +30,12 @@ export const useSubagents = create<SubagentStore>((set) => ({
     set((s) => ({ open: { ...s.open, [chat]: thread } }));
   },
   hide(chat) {
-    set((s) => ({ open: { ...s.open, [chat]: undefined } }));
+    set((s) => {
+      const thread = s.open[chat];
+      const views = { ...s.views };
+      if (thread) delete views[threadKey(chat, thread)];
+      return { open: { ...s.open, [chat]: undefined }, views };
+    });
   },
   set(key, fn) {
     set((s) => ({ views: { ...s.views, [key]: fn(s.views[key] ?? { loading: true }) } }));
@@ -51,9 +57,15 @@ export function watchThread(host: string, session: string, chat: string, thread:
     store.set(key, (v) => ({ ...v, loading: false, error: '主机未连接' }));
     return () => undefined;
   }
+  return watchThreadOnConnection(conn, session, chat, thread);
+}
+
+/** Kept separate so compatibility behavior can be tested without a live relay provider. */
+export function watchThreadOnConnection(conn: HostConnection, session: string, chat: string, thread: string): () => void {
+  const key = threadKey(chat, thread);
   let disposed = false;
   let loading = false;
-  let early: Parameters<typeof applyThreadEvent>[1][] = [];
+  let early: ChatEvent[] = [];
 
   const load = async () => {
     if (loading || disposed) return;
@@ -61,32 +73,44 @@ export function watchThread(host: string, session: string, chat: string, thread:
     early = [];
     useSubagents.getState().set(key, (v) => ({ ...v, loading: !v.order, error: undefined }));
     try {
+      if (!supportsFeature(conn, FEATURE_SUBAGENTS)) {
+        useSubagents.getState().set(key, (v) => ({ ...v, loading: false, error: '主机版本过旧，无法查看子智能体的过程' }));
+        return;
+      }
       const res = await call(conn, { op: 'chat_thread', session, thread, limit: PAGE }, 'chat_thread');
       if (disposed) return;
       let st = threadFromPage(res.items, res.more, res.seq);
-      for (const e of early) st = applyThreadEvent(st, e, thread);
+      let reload = false;
+      for (const e of early) {
+        const result = applyThreadEventResult(st, e, thread);
+        st = result.state;
+        reload ||= result.gap || result.reload;
+      }
       early = [];
       useSubagents.getState().set(key, () => ({ ...st, loading: false }));
+      if (reload) void load();
     } catch (err) {
       if (disposed) return;
-      const unknown = /unknown variant|chat_thread/.test((err as Error).message);
-      useSubagents.getState().set(key, (v) => ({ ...v, loading: false, error: unknown ? '主机版本过旧，无法查看子智能体的过程' : (err as Error).message }));
+      useSubagents.getState().set(key, (v) => ({ ...v, loading: false, error: (err as Error).message }));
     } finally {
       loading = false;
     }
   };
 
   const offEvent = conn.onEvent((e) => {
-    if ((e.ev !== 'chat_item' && e.ev !== 'chat_delta') || e.session !== session) return;
+    if (!isChatEvent(e) || e.session !== session) return;
     if (loading) {
       early.push(e);
       return;
     }
+    let reload = false;
     useSubagents.getState().set(key, (v) => {
       if (!v.order) return v;
-      const next = applyThreadEvent(v as ThreadState, e, thread);
-      return next === v ? v : { ...v, ...next };
+      const result = applyThreadEventResult(v as ThreadState, e, thread);
+      reload = result.gap || result.reload;
+      return result.state === v ? v : { ...v, ...result.state };
     });
+    if (reload) void load();
   });
   const offRe = conn.onReconnected(() => void load());
   void load();
@@ -103,7 +127,7 @@ export async function loadOlderThread(host: string, session: string, chat: strin
   const v = useSubagents.getState().views[key];
   const conn = getConn(host);
   const before = v?.order?.[0];
-  if (!conn || !v?.more || v.loadingOlder || before === undefined) return;
+  if (!conn || !supportsFeature(conn, FEATURE_SUBAGENTS) || !v?.more || v.loadingOlder || before === undefined) return;
   useSubagents.getState().set(key, (x) => ({ ...x, loadingOlder: true }));
   try {
     const res = await call(conn, { op: 'chat_thread', session, thread, before, limit: PAGE }, 'chat_thread');

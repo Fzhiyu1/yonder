@@ -37,7 +37,7 @@ import {
   mockPrompt,
   mockTerminalIntro,
 } from './mockData';
-import { RequestError, type ConnStatus, type HostConnection } from './types';
+import { FEATURE_SUBAGENTS, RequestError, type ConnStatus, type HostConnection } from './types';
 
 /** Items in the `attached` snapshot (the host sends the newest page only). */
 const MOCK_PAGE = 40;
@@ -144,7 +144,7 @@ class MockHost implements HostConnection {
       vapid_public: 'BMock',
     };
     this.hostHello = online
-      ? { protocol: 1, ok: true, host_name: name, os, version: '0.1.0', permissions: ['sessions', 'files'] }
+      ? { protocol: 1, ok: true, host_name: name, os, version: '0.1.0', permissions: ['sessions', 'files'], features: [FEATURE_SUBAGENTS] }
       : undefined;
     this.devices = [
       { public: 'dWebThisDevice000000000000000000000000000000', name: '当前浏览器', client: 'web', paired_at: now() - 20 * 24 * HOUR, last_seen: now(), permissions: ['sessions', 'files'], current: true },

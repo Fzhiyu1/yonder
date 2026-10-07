@@ -2,23 +2,23 @@
 import type { ApprovalKind } from "./ApprovalKind";
 import type { ApprovalOption } from "./ApprovalOption";
 
-export type Approval = { id: string, kind: ApprovalKind, 
+export type Approval = { id: string, kind: ApprovalKind,
 /**
  * One-line summary for lists and notifications.
  */
-title: string, command?: string, cwd?: string, diff?: string, reason?: string, 
+title: string, command?: string, cwd?: string, diff?: string, reason?: string,
 /**
  * Extra detail, e.g. pretty-printed tool input.
  */
-detail?: string, options: Array<ApprovalOption>, 
+detail?: string, options: Array<ApprovalOption>,
 /**
  * Related chat item id.
  */
-item?: string, ts: number, 
+item?: string, ts: number,
 /**
  * Raised inside this sub-agent (`Subagent::id`); answered like any other approval.
  */
-thread?: string, 
+thread?: string,
 /**
  * Display name of that sub-agent (`Subagent::name`), when known.
  */

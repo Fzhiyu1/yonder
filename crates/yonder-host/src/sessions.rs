@@ -19,8 +19,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use yonder_proto::app::{
-    AgentKind, ApiError, ApprovalMode, ChatSnapshot, ChatStatus, Event, HostMsg, SessionInfo, SessionKind,
-    SessionOrigin, SessionSpec, SessionState, TerminalSnapshot,
+    AgentKind, ApiError, Approval, ApprovalMode, ChatItem, ChatItemKind, ChatSnapshot, ChatStatus, Event, HostMsg,
+    Response, SessionInfo, SessionKind, SessionOrigin, SessionSpec, SessionState, TerminalSnapshot,
 };
 use yonder_pty::{SupEvent, SupRequest, SupervisorArgs, SupervisorClient};
 
@@ -91,16 +91,31 @@ pub struct ClientHandle {
     pub tx: mpsc::Sender<HostMsg>,
     /// Set when the client falls behind; its link is then resynced or closed.
     pub lagged: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether this client understands the sub-agent event extensions.
+    pub supports_subagents: bool,
 }
 
 impl ClientHandle {
     pub fn new(id: u64) -> (Self, mpsc::Receiver<HostMsg>) {
+        Self::new_with_features(id, true)
+    }
+
+    pub fn new_with_features(id: u64, supports_subagents: bool) -> (Self, mpsc::Receiver<HostMsg>) {
         let (tx, rx) = mpsc::channel(CLIENT_QUEUE);
-        (Self { id, tx, lagged: Arc::new(std::sync::atomic::AtomicBool::new(false)) }, rx)
+        (
+            Self {
+                id,
+                tx,
+                lagged: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                supports_subagents,
+            },
+            rx,
+        )
     }
 
     /// Non-blocking send; marks the client lagged when its queue is full.
     pub fn send(&self, m: HostMsg) -> bool {
+        let Some(m) = self.compatible(m) else { return true };
         match self.tx.try_send(m) {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -109,6 +124,79 @@ impl ClientHandle {
             }
             Err(mpsc::error::TrySendError::Closed(_)) => false,
         }
+    }
+
+    pub async fn send_async(&self, m: HostMsg) -> bool {
+        if let Some(m) = self.compatible(m) {
+            self.tx.send(m).await.is_ok()
+        } else {
+            true
+        }
+    }
+
+    fn compatible(&self, m: HostMsg) -> Option<HostMsg> {
+        if self.supports_subagents {
+            return Some(m);
+        }
+        match m {
+            HostMsg::Event { event } => legacy_event(event).map(HostMsg::event),
+            HostMsg::Res { id, ok, mut data, error } => {
+                if let Some(response) = data.as_mut() {
+                    legacy_response(response);
+                }
+                Some(HostMsg::Res { id, ok, data, error })
+            }
+        }
+    }
+}
+
+fn legacy_item(mut item: ChatItem) -> Option<ChatItem> {
+    if item.thread.is_some() {
+        return None;
+    }
+    if item.kind == ChatItemKind::Subagent {
+        let sub = item.subagent.take();
+        item.kind = ChatItemKind::Tool;
+        item.title = item.title.or_else(|| sub.as_ref().and_then(|s| s.name.clone().or_else(|| s.role.clone())).or_else(|| Some("Sub-agent".into())));
+        item.output = item.output.or_else(|| sub.and_then(|s| s.reply));
+    }
+    item.subagent = None;
+    Some(item)
+}
+
+fn legacy_approval(approval: &mut Approval) {
+    approval.thread = None;
+    approval.thread_name = None;
+}
+
+fn legacy_snapshot(snapshot: &mut ChatSnapshot) {
+    snapshot.items = std::mem::take(&mut snapshot.items).into_iter().filter_map(legacy_item).collect();
+    snapshot.approvals.iter_mut().for_each(legacy_approval);
+}
+
+fn legacy_response(response: &mut Response) {
+    match response {
+        Response::Attached { chat: Some(snapshot), .. } => legacy_snapshot(snapshot),
+        Response::ChatOlder { items, .. } | Response::ChatThread { items, .. } => {
+            *items = std::mem::take(items).into_iter().filter_map(legacy_item).collect();
+        }
+        _ => {}
+    }
+}
+
+fn legacy_event(event: Event) -> Option<Event> {
+    match event {
+        Event::ChatItem { session, seq, item } => legacy_item(item).map(|item| Event::ChatItem { session, seq, item }),
+        Event::ChatDelta { thread: Some(_), .. } => None,
+        Event::ChatSnapshot { session, mut snapshot } => {
+            legacy_snapshot(&mut snapshot);
+            Some(Event::ChatSnapshot { session, snapshot })
+        }
+        Event::ApprovalRequested { session, seq, mut approval } => {
+            legacy_approval(&mut approval);
+            Some(Event::ApprovalRequested { session, seq, approval })
+        }
+        other => Some(other),
     }
 }
 
@@ -1679,5 +1767,51 @@ mod tests {
     fn titles() {
         assert_eq!(default_title(AgentKind::Codex, &[], Path::new("/x/proj")), "codex · proj");
         assert_eq!(default_title(AgentKind::Custom, &["/usr/bin/htop".into()], Path::new("/x/y")), "htop · y");
+    }
+
+    #[test]
+    fn legacy_clients_do_not_receive_thread_items_or_fields() {
+        let (client, mut rx) = ClientHandle::new_with_features(1, false);
+        let mut child = ChatItem::new("child", ChatItemKind::Agent, yonder_proto::app::ItemStatus::Completed, 1);
+        child.thread = Some("kid".into());
+        assert!(client.send(HostMsg::event(Event::ChatItem { session: "s".into(), seq: 1, item: child })));
+        assert!(rx.try_recv().is_err());
+
+        let mut card = ChatItem::new("card", ChatItemKind::Subagent, yonder_proto::app::ItemStatus::Completed, 2);
+        card.text = Some("task".into());
+        card.subagent = Some(yonder_proto::app::Subagent {
+            id: "kid".into(),
+            name: Some("Ada".into()),
+            role: None,
+            model: None,
+            status: yonder_proto::app::SubagentStatus::Done,
+            reply: Some("done".into()),
+        });
+        client.send(HostMsg::event(Event::ChatItem { session: "s".into(), seq: 2, item: card }));
+        let HostMsg::Event { event: Event::ChatItem { item, .. } } = rx.try_recv().unwrap() else { panic!() };
+        assert_eq!(item.kind, ChatItemKind::Tool);
+        assert!(item.subagent.is_none());
+        assert!(item.thread.is_none());
+
+        let mut approval = Approval {
+            id: "a".into(),
+            kind: yonder_proto::app::ApprovalKind::Command,
+            title: "run".into(),
+            command: None,
+            cwd: None,
+            diff: None,
+            reason: None,
+            detail: None,
+            options: Vec::new(),
+            item: None,
+            ts: 3,
+            thread: Some("kid".into()),
+            thread_name: Some("Ada".into()),
+        };
+        client.send(HostMsg::event(Event::ApprovalRequested { session: "s".into(), seq: 3, approval: approval.clone() }));
+        let HostMsg::Event { event: Event::ApprovalRequested { approval: received, .. } } = rx.try_recv().unwrap() else { panic!() };
+        assert!(received.thread.is_none());
+        assert!(received.thread_name.is_none());
+        approval.thread = None;
     }
 }
