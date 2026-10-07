@@ -1,0 +1,20 @@
+[package]
+name = "yonder-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "yonder wire protocol: relay framing, Noise channel, app messages"
+
+[features]
+default = []
+ts = ["dep:ts-rs"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+snow = { version = "0.10", default-features = false, features = ["use-chacha20poly1305", "use-blake2", "use-curve25519", "use-getrandom"] }
+blake2 = "0.10"
+base64 = "0.22"
+getrandom = "0.3"
+thiserror = "2"
+ts-rs = { version = "12", optional = true, features = ["serde-json-impl", "no-serde-warnings"] }

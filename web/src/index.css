@@ -1,0 +1,451 @@
+@import 'tailwindcss';
+@import '@xterm/xterm/css/xterm.css';
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  --bg: #ffffff;
+  --panel: #f7f7f8;
+  --hover: #efeff1;
+  --active: #e7e7ea;
+  --border: #e4e4e7;
+  --border-strong: #d4d4d8;
+  --fg: #18181b;
+  --muted: #63636b;
+  --faint: #9d9da6;
+  --accent: #2563eb;
+  --accent-fg: #ffffff;
+  --accent-soft: #eff4ff;
+  --ok: #15803d;
+  --warn: #b45309;
+  --warn-soft: #fef6e7;
+  --danger: #dc2626;
+  --danger-soft: #fdf0f0;
+  --code: #f4f4f5;
+  --overlay: rgb(0 0 0 / 0.32);
+  --shadow: 0 8px 28px rgb(0 0 0 / 0.12), 0 1px 3px rgb(0 0 0 / 0.08);
+  color-scheme: light;
+}
+
+.dark {
+  --bg: #0f0f10;
+  --panel: #18181b;
+  --hover: #1f1f23;
+  --active: #27272b;
+  --border: #2a2a2f;
+  --border-strong: #3a3a40;
+  --fg: #ececef;
+  --muted: #a0a0a9;
+  --faint: #6b6b74;
+  --accent: #3b82f6;
+  --accent-fg: #ffffff;
+  --accent-soft: #172033;
+  --ok: #22c55e;
+  --warn: #f59e0b;
+  --warn-soft: #251d0e;
+  --danger: #f05252;
+  --danger-soft: #2a1414;
+  --code: #151517;
+  --overlay: rgb(0 0 0 / 0.55);
+  --shadow: 0 8px 28px rgb(0 0 0 / 0.5), 0 0 0 1px rgb(255 255 255 / 0.04);
+  color-scheme: dark;
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-panel: var(--panel);
+  --color-hover: var(--hover);
+  --color-active: var(--active);
+  --color-line: var(--border);
+  --color-line-strong: var(--border-strong);
+  --color-fg: var(--fg);
+  --color-muted: var(--muted);
+  --color-faint: var(--faint);
+  --color-accent: var(--accent);
+  --color-accent-fg: var(--accent-fg);
+  --color-accent-soft: var(--accent-soft);
+  --color-ok: var(--ok);
+  --color-warn: var(--warn);
+  --color-warn-soft: var(--warn-soft);
+  --color-danger: var(--danger);
+  --color-danger-soft: var(--danger-soft);
+  --color-code: var(--code);
+  --color-overlay: var(--overlay);
+  --shadow-pop: var(--shadow);
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif;
+  --font-mono: ui-monospace, 'SFMono-Regular', 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.5;
+  letter-spacing: 0;
+  -webkit-font-smoothing: antialiased;
+  overscroll-behavior: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+#root {
+  /* The visible part of the screen: on iOS the soft keyboard overlays the page, so the app
+     follows the visual viewport (see lib/viewport.ts) to keep the composer above it. */
+  position: fixed;
+  inset-inline: 0;
+  top: var(--vv-top, 0px);
+  height: var(--vv-height, 100dvh);
+}
+
+/* Full-screen overlays share the same band. */
+.app-band {
+  top: var(--vv-top, 0px);
+  height: var(--vv-height, 100dvh);
+}
+
+/* While the keyboard is up the home indicator is hidden: no bottom inset needed. */
+html[data-kb] .safe-bottom {
+  padding-bottom: 0;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: default;
+}
+
+/* Touch screens have no hover state and the tap highlight is off: show a press instead. An
+   inset shadow tints any background (transparent or filled) without touching the content. */
+@media (hover: none) {
+  :is(button, [role='button'], a[href], summary):not(:disabled):active {
+    box-shadow: inset 0 0 0 100vmax color-mix(in srgb, var(--fg) 9%, transparent);
+  }
+}
+
+/* In the base layer so utilities (`focus:outline-none` on fields that show focus with their
+   border) can override it; unlayered CSS would always win over Tailwind's layers. */
+@layer base {
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+}
+
+input,
+textarea,
+select {
+  font: inherit;
+  color: inherit;
+}
+
+/* iOS zooms into inputs smaller than 16px. */
+@media (max-width: 767px) {
+  input,
+  textarea,
+  select {
+    font-size: 16px !important;
+  }
+}
+
+::selection {
+  background: color-mix(in srgb, var(--accent) 28%, transparent);
+}
+
+.scroll-thin {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+.scroll-none {
+  scrollbar-width: none;
+}
+.scroll-none::-webkit-scrollbar {
+  display: none;
+}
+
+/* Artifact viewer over the chat on phones and tablets. */
+@keyframes viewer-up {
+  from {
+    transform: translateY(24px);
+    opacity: 0;
+  }
+}
+.viewer-sheet {
+  animation: viewer-up 200ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.safe-top {
+  padding-top: env(safe-area-inset-top);
+}
+.safe-bottom {
+  padding-bottom: env(safe-area-inset-bottom);
+}
+.safe-x {
+  padding-left: env(safe-area-inset-left);
+  padding-right: env(safe-area-inset-right);
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes pulse-dot {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.pulse-dot {
+  animation: pulse-dot 1.4s ease-in-out infinite;
+}
+
+/* Sheets: slide up from the bottom on phones, scale in on larger screens. */
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+}
+@keyframes fade-out {
+  to {
+    opacity: 0;
+  }
+}
+@keyframes sheet-up {
+  from {
+    transform: translateY(100%);
+  }
+}
+@keyframes sheet-down {
+  to {
+    transform: translateY(100%);
+  }
+}
+@keyframes pop-in {
+  from {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+}
+@keyframes pop-out {
+  to {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+}
+
+.sheet-overlay[data-state='open'] {
+  animation: fade-in 180ms ease-out;
+}
+.sheet-overlay[data-state='closed'] {
+  animation: fade-out 200ms ease-in forwards;
+  pointer-events: none;
+}
+.sheet-panel {
+  transition: transform 200ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.sheet-panel[data-state='open'] {
+  animation: sheet-up 260ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.sheet-panel[data-state='closed'] {
+  animation: sheet-down 200ms ease-in forwards;
+}
+@media (min-width: 768px) {
+  .sheet-panel[data-state='open'] {
+    animation: pop-in 180ms ease-out;
+  }
+  .sheet-panel[data-state='closed'] {
+    animation: pop-out 150ms ease-in forwards;
+  }
+}
+
+.menu-pop {
+  animation: pop-in 120ms ease-out;
+  transform-origin: top right;
+}
+.menu-pop[data-up] {
+  transform-origin: bottom right;
+}
+
+@keyframes rise-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+}
+.rise-in {
+  animation: rise-in 180ms ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+  }
+}
+
+@keyframes caret {
+  50% {
+    opacity: 0;
+  }
+}
+
+.stream-caret::after {
+  content: '';
+  display: inline-block;
+  width: 7px;
+  height: 1em;
+  margin-left: 2px;
+  vertical-align: -2px;
+  background: var(--muted);
+  animation: caret 1s steps(1) infinite;
+}
+
+/* Markdown */
+.md {
+  overflow-wrap: anywhere;
+  line-height: 1.65;
+}
+.md > :first-child {
+  margin-top: 0;
+}
+.md > :last-child {
+  margin-bottom: 0;
+}
+.md p,
+.md ul,
+.md ol,
+.md table,
+.md blockquote,
+.md pre {
+  margin: 0.6em 0;
+}
+.md h1,
+.md h2,
+.md h3,
+.md h4 {
+  margin: 1em 0 0.4em;
+  font-weight: 600;
+  line-height: 1.35;
+}
+.md h1 {
+  font-size: 1.25em;
+}
+.md h2 {
+  font-size: 1.15em;
+}
+.md h3,
+.md h4 {
+  font-size: 1em;
+}
+.md ul,
+.md ol {
+  padding-left: 1.4em;
+}
+.md ul {
+  list-style: disc;
+}
+.md ol {
+  list-style: decimal;
+}
+.md li {
+  margin: 0.2em 0;
+}
+.md li > input[type='checkbox'] {
+  margin-right: 0.4em;
+  vertical-align: -1px;
+}
+.md ul:has(> li > input[type='checkbox']) {
+  list-style: none;
+  padding-left: 0.2em;
+}
+.md a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.md blockquote {
+  border-left: 3px solid var(--border-strong);
+  padding-left: 0.8em;
+  color: var(--muted);
+}
+.md :not(pre) > code {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  background: var(--code);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.05em 0.3em;
+}
+/* Phones: inline code must stay readable (>= 12.5px) inside smaller text. */
+@media (max-width: 767px) {
+  .md :not(pre) > code {
+    font-size: max(0.9em, 12.5px);
+  }
+}
+.md table {
+  display: block;
+  overflow-x: auto;
+  border-collapse: collapse;
+  max-width: 100%;
+  font-size: 0.93em;
+}
+.md th,
+.md td {
+  border: 1px solid var(--border);
+  padding: 0.35em 0.7em;
+  text-align: left;
+  vertical-align: top;
+}
+.md th {
+  background: var(--panel);
+  font-weight: 600;
+}
+.md hr {
+  border: 0;
+  border-top: 1px solid var(--border);
+  margin: 1em 0;
+}
+.md img {
+  max-width: 100%;
+  border-radius: 6px;
+}
+
+/* xterm */
+.term-host .xterm {
+  height: 100%;
+}
+.term-host .xterm,
+.term-host .xterm-viewport,
+.term-host .xterm-screen {
+  background-color: transparent !important;
+}
+.term-host .xterm-viewport {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+.no-scrollbar {
+  scrollbar-width: none;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}

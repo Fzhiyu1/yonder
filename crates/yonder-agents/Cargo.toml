@@ -1,0 +1,24 @@
+[package]
+name = "yonder-agents"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Structured chat adapters for coding agents (Codex app-server, Claude Code stream-json, pi RPC)"
+
+[dependencies]
+yonder-proto.workspace = true
+anyhow = "1"
+base64 = "0.22"
+dirs = "6"
+getrandom = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "sync", "time"] }
+tracing = "0.1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "rt-multi-thread", "sync", "time"] }

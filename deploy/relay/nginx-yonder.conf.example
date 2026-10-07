@@ -1,0 +1,22 @@
+# yonder relay behind nginx on a non-standard port (example: 2097 with an IP certificate).
+# Needs `map $http_upgrade $connection_upgrade { default upgrade; '' close; }` in http{}.
+server {
+    listen 2097 ssl;
+    server_name 203.0.113.10;                      # example IP / domain
+    ssl_certificate     /etc/nginx/certs/fullchain.pem;
+    ssl_certificate_key /etc/nginx/certs/key.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    location / {
+        proxy_pass http://127.0.0.1:3092;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_buffering off;
+    }
+}

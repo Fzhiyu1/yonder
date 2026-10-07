@@ -1,0 +1,26 @@
+[package]
+name = "yonder-notify"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Host-side notifications for yonder: ntfy, Bark, webhook and Web Push (VAPID)"
+
+[dependencies]
+aes-gcm = "0.10"
+anyhow = "1"
+base64 = "0.22"
+futures-util = "0.3"
+getrandom = "0.3"
+hkdf = "0.12"
+p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["sync", "time", "macros"] }
+tracing = "0.1"
+url = "2"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }

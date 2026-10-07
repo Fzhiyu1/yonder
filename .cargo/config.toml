@@ -1,0 +1,6 @@
+[env]
+TS_RS_EXPORT_DIR = { value = "web/src/proto/generated", relative = true }
+TS_RS_LARGE_INT = "number"
+
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']

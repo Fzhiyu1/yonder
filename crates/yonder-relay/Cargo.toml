@@ -1,0 +1,39 @@
+[package]
+name = "yonder-relay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "yonder relay: forwards end-to-end encrypted frames between devices and hosts"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "yonder-relay"
+path = "src/main.rs"
+
+[dependencies]
+yonder-proto.workspace = true
+anyhow = "1"
+axum = { version = "0.8", features = ["ws"] }
+clap = { version = "4", features = ["derive", "env"] }
+futures-util = "0.3"
+hyper = "1"
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal", "fs"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls-acme = { version = "0.15", default-features = false, features = ["ring", "tokio", "tls12", "webpki-roots"] }
+rustls-pemfile = "2"
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.7", features = ["fs", "set-header"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "crypto"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }

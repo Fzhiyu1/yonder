@@ -1,0 +1,34 @@
+[Unit]
+Description=yonder relay (end-to-end encrypted device <-> host forwarding)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=yonder-relay
+WorkingDirectory=/var/lib/yonder-relay
+Environment=RUST_LOG=info
+# Behind nginx (TLS terminated there). For direct TLS use --tls-cert/--tls-key or --acme-domain.
+ExecStart=/opt/yonder-relay/yonder-relay --listen 127.0.0.1:3092 --behind-proxy --key-file /var/lib/yonder-relay/relay.key --web-dir /opt/yonder-relay/web
+Restart=always
+RestartSec=2
+MemoryMax=96M
+TasksMax=64
+LimitNOFILE=8192
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

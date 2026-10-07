@@ -1,0 +1,29 @@
+[package]
+name = "yonder-pty"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cross-platform PTY sessions owned by detached supervisor processes"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "fs"] }
+portable-pty = "0.9"
+vt100 = "0.16"
+interprocess = { version = "2.4", features = ["tokio"] }
+tracing = "0.1"
+which = "8"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+widestring = "1"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

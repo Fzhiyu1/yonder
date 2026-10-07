@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="same-origin">
+<title>Yonder preview</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #fff; }
+  iframe { display: block; border: 0; width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<script>
+// Preview bridge. Embedded by the Yonder app with ?id=<preview id>&parent=<app origin>
+// &path=<initial path>&mode=root|prefix. Registers the preview service worker, shows the page
+// in a nested frame, and relays the worker's fetches to the app, which answers them over the
+// encrypted channel. Messages only ever go to the app origin named in `parent`.
+(() => {
+  'use strict';
+  const q = new URLSearchParams(location.search);
+  const id = q.get('id') || '';
+  const parentOrigin = q.get('parent') || '';
+  const prefixed = q.get('mode') === 'prefix';
+  let path = q.get('path') || '/';
+  if (!/^[0-9a-f]{32}$/.test(id) || window.parent === window) return;
+  let valid = false;
+  try {
+    valid = new URL(parentOrigin).origin === parentOrigin && parentOrigin !== location.origin;
+  } catch {
+    valid = false;
+  }
+  // `parent` must name the real embedder when the browser can tell who that is.
+  const ancestors = location.ancestorOrigins;
+  if (!valid || (ancestors && ancestors.length > 0 && ancestors[0] !== parentOrigin)) return;
+  if (!path.startsWith('/') || path.startsWith('//')) path = '/';
+
+  const send = (msg, transfer) => window.parent.postMessage(msg, parentOrigin, transfer || []);
+  const fail = (err) => send({ type: 'yonder-preview-error', id, message: String((err && err.message) || err) });
+  if (!('serviceWorker' in navigator)) {
+    fail('service workers unavailable');
+    return;
+  }
+
+  navigator.serviceWorker.addEventListener('message', (e) => {
+    const d = e.data;
+    if (typeof ServiceWorker !== 'undefined' && !(e.source instanceof ServiceWorker)) return;
+    if (!d || d.type !== 'yonder-preview-fetch' || d.id !== id || typeof d.path !== 'string' || !e.ports[0]) return;
+    const toWorker = e.ports[0];
+    const channel = new MessageChannel();
+    channel.port1.onmessage = (r) => {
+      const body = r.data && r.data.body;
+      toWorker.postMessage(r.data, body instanceof ArrayBuffer ? [body] : []);
+      channel.port1.close();
+    };
+    send({ type: 'yonder-preview-fetch', id, path: d.path }, [channel.port2]);
+  });
+  navigator.serviceWorker.startMessages();
+
+  navigator.serviceWorker
+    .register('/preview-sw.js', { scope: '/', updateViaCache: 'none' })
+    .then(() => navigator.serviceWorker.ready)
+    .then(() => {
+      send({ type: 'yonder-preview-ready', id });
+      const frame = document.createElement('iframe');
+      frame.title = 'Preview';
+      frame.allow = 'fullscreen';
+      frame.addEventListener('load', () => send({ type: 'yonder-preview-loaded', id }));
+      frame.src = (prefixed ? '/__p/' + id : '') + path;
+      document.body.appendChild(frame);
+    })
+    .catch(fail);
+})();
+</script>
+</body>
+</html>
