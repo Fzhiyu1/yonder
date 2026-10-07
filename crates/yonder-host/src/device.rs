@@ -35,6 +35,18 @@ impl Drop for DeviceClient {
 impl DeviceClient {
     /// Connect through `relay_url` to `host` and complete the handshake.
     pub async fn connect(relay_url: &str, device: &Keypair, host: &PublicKey, name: &str, pair_token: Option<&str>) -> Result<Self> {
+        Self::connect_with_features(relay_url, device, host, name, pair_token, Some(vec![FEATURE_SUBAGENTS.into()])).await
+    }
+
+    /// Connect with an explicit feature list. `None` models a pre-capability-negotiation client.
+    pub async fn connect_with_features(
+        relay_url: &str,
+        device: &Keypair,
+        host: &PublicKey,
+        name: &str,
+        pair_token: Option<&str>,
+        features: Option<Vec<String>>,
+    ) -> Result<Self> {
         let tls = rustls_config();
         let connector = if relay_url.starts_with("wss://") {
             Some(tokio_tungstenite::Connector::Rustls(tls))
@@ -71,7 +83,7 @@ impl DeviceClient {
             device_name: name.into(),
             client: "cli".into(),
             pair_token: pair_token.map(str::to_string),
-            features: Some(vec![FEATURE_SUBAGENTS.into()]),
+            features,
         };
         let m1 = ini.write_hello(&hello)?;
         sink.send(Message::Binary(relay::encode_frame(link, &m1).into())).await?;

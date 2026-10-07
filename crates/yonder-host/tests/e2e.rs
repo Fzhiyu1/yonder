@@ -418,6 +418,15 @@ async fn full_flow_through_relay() {
     };
     assert!(xs.approval_live, "{xs:?}");
     let mut xchat = ChatState::from_snapshot(&xsnap);
+    // A pre-capability-negotiation client still completes the Noise handshake, but receives
+    // only the legacy-compatible projection of sub-agent events.
+    let legacy = DeviceClient::connect_with_features(&relay_url, &device, &host_pub, "old-client", None, None).await.unwrap();
+    let Response::Attached { chat: Some(legacy_snap), .. } =
+        legacy.request(Request::Attach { session: xid.clone(), since: None }).await.unwrap()
+    else {
+        panic!()
+    };
+    assert!(legacy_snap.items.iter().all(|i| i.thread.is_none() && i.subagent.is_none()));
     dev.request(Request::ChatSend { session: xid.clone(), text: "run touch a".into(), attachments: vec![] }).await.unwrap();
     chat_until(&dev, &mut xchat, &xid, "codex approval pending", |st| !st.approvals.is_empty()).await;
     // Switching to full access answers the pending approval.
@@ -459,6 +468,50 @@ async fn full_flow_through_relay() {
     // ---- sub-agents (fake codex): a card in the chat, its thread on request, its approval here
     dev.request(Request::SetApprovalMode { session: xid.clone(), mode: ApprovalMode::Ask }).await.unwrap();
     dev.request(Request::ChatSend { session: xid.clone(), text: "spawn touch sub".into(), attachments: vec![] }).await.unwrap();
+    let legacy_item = legacy
+        .wait_event(Duration::from_secs(20), |ev| {
+            match ev {
+                Event::ChatItem { session, item, .. } if *session == xid => {
+                    assert!(item.thread.is_none());
+                    assert!(item.subagent.is_none());
+                    (item.kind == ChatItemKind::Tool).then_some(item.clone())
+                }
+                Event::ChatDelta { session, thread, .. } if *session == xid => {
+                    assert!(thread.is_none(), "legacy client received a thread delta");
+                    None
+                }
+                Event::ApprovalRequested { session, approval, .. } if *session == xid => {
+                    assert!(approval.thread.is_none());
+                    assert!(approval.thread_name.is_none());
+                    None
+                }
+                _ => None,
+            }
+        })
+        .await
+        .expect("legacy client should receive a downgraded sub-agent card");
+    assert!(legacy_item.thread.is_none());
+    assert!(legacy_item.subagent.is_none());
+    legacy
+        .wait_event(Duration::from_secs(20), |ev| match ev {
+            Event::ApprovalRequested { session, approval, .. } if *session == xid => {
+                assert!(approval.thread.is_none());
+                assert!(approval.thread_name.is_none());
+                Some(())
+            }
+            Event::ChatItem { session, item, .. } if *session == xid => {
+                assert!(item.thread.is_none());
+                assert!(item.subagent.is_none());
+                None
+            }
+            Event::ChatDelta { session, thread, .. } if *session == xid => {
+                assert!(thread.is_none(), "legacy client received a thread delta");
+                None
+            }
+            _ => None,
+        })
+        .await
+        .expect("legacy client should receive an answerable un-attributed approval");
     let card_of = |st: &ChatState| st.items().iter().find(|i| i.kind == ChatItemKind::Subagent).cloned();
     chat_until(&dev, &mut xchat, &xid, "sub-agent card named", |st| {
         card_of(st).and_then(|c| c.subagent).is_some_and(|s| s.name.as_deref() == Some("Fakey") && s.status == SubagentStatus::Running)
@@ -534,6 +587,7 @@ async fn full_flow_through_relay() {
         panic!()
     };
     assert!(items.iter().any(|i| i.kind == ChatItemKind::Agent && i.text.as_deref() == Some("DONE")), "{items:?}");
+    drop(legacy);
 
     // ---- files
     let root = dunce_canon(&env.work);
