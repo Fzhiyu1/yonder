@@ -88,6 +88,7 @@ export function watchThreadOnConnection(conn: HostConnection, session: string, c
       }
       early = [];
       useSubagents.getState().set(key, () => ({ ...st, loading: false }));
+      loading = false;
       if (reload) void load();
     } catch (err) {
       if (disposed) return;

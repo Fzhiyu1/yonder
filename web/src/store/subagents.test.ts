@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { ChatItem } from '../proto/generated/ChatItem';
+import type { Event } from '../proto/generated/Event';
+import type { Response } from '../proto/generated/Response';
 import type { HostConnection } from '../net/types';
 import { threadKey, useSubagents, watchThreadOnConnection } from './subagents';
 
@@ -35,5 +37,45 @@ describe('sub-agent store compatibility and lifecycle', () => {
     });
     useSubagents.getState().hide('h/s');
     expect(useSubagents.getState().views[key]).toBeUndefined();
+  });
+
+  it('does not lose a reload requested while the initial page is loading', async () => {
+    let resolveFirst!: (response: Response) => void;
+    let calls = 0;
+    let onEvent: ((event: Event) => void) | undefined;
+    const conn = {
+      status: 'online',
+      hostHello: { protocol: 1, ok: true, host_name: 'new', os: 'linux', version: '0.1.0', permissions: ['sessions'], features: ['subagents'] },
+      request: async () => {
+        calls++;
+        if (calls === 1) {
+          return new Promise<Response>((resolve) => {
+            resolveFirst = resolve;
+          });
+        }
+        return {
+          kind: 'chat_thread',
+          items: [item('latest')],
+          more: false,
+          seq: 12,
+        };
+      },
+      onEvent: (fn: (event: Event) => void) => {
+        onEvent = fn;
+        return () => undefined;
+      },
+      onReconnected: () => () => undefined,
+    } as unknown as HostConnection;
+    useSubagents.setState({ views: {}, open: {} });
+    const stop = watchThreadOnConnection(conn, 's', 'h/s', 'kid');
+    await Promise.resolve();
+    onEvent?.({ ev: 'chat_item', session: 's', seq: 12, item: item('live') });
+    resolveFirst({ kind: 'chat_thread', items: [item('initial')], more: false, seq: 10 });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(calls).toBe(2);
+    expect(useSubagents.getState().views[threadKey('h/s', 'kid')]?.order).toEqual(['latest']);
+    stop();
   });
 });
