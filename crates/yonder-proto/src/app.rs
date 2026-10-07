@@ -74,6 +74,19 @@ ts_export! {
             since: Option<u64>,
         },
         Detach { session: String },
+        /// Items of one sub-agent's thread (read-only view), oldest first: the newest page, or
+        /// the page right before `before`. Live items of the thread arrive as `chat_item` /
+        /// `chat_delta` with `thread` set; apply those with a seq above the answer's `seq`.
+        ChatThread {
+            session: String,
+            /// `Subagent::id` of the card.
+            thread: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            before: Option<String>,
+            /// Page size (default 200, max 500).
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            limit: Option<u32>,
+        },
         /// Chat items right before `before` (an item id the client has), oldest first. The
         /// `attached` snapshot carries only the newest page; scrolling up fetches more.
         ChatOlder {
@@ -233,6 +246,14 @@ ts_export! {
             /// Even older items exist.
             more: bool,
         },
+        ChatThread {
+            /// Oldest first.
+            items: Vec<ChatItem>,
+            /// Even older items exist.
+            more: bool,
+            /// Seq of the last event reflected in `items`.
+            seq: u64,
+        },
         HttpResponse {
             status: u16,
             /// Response headers (lowercase names), e.g. `content-type`.
@@ -278,8 +299,17 @@ ts_export! {
         PtyResized { session: String, cols: u16, rows: u16 },
         /// Insert or replace a chat item (by id).
         ChatItem { session: String, seq: u64, item: ChatItem },
-        /// Append streaming text to an existing item field.
-        ChatDelta { session: String, seq: u64, item: String, field: DeltaField, delta: String },
+        /// Append streaming text to an existing item field. `thread`: the item belongs to that
+        /// sub-agent's thread (see `ChatItem::thread`).
+        ChatDelta {
+            session: String,
+            seq: u64,
+            item: String,
+            field: DeltaField,
+            delta: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            thread: Option<String>,
+        },
         /// Replace the whole chat view (e.g. after the client fell behind).
         ChatSnapshot { session: String, snapshot: ChatSnapshot },
         ChatStatus {
@@ -447,6 +477,8 @@ ts_export! {
         WebSearch,
         Error,
         System,
+        /// A sub-agent spawned by the agent (card; details in `ChatItem::subagent`).
+        Subagent,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -482,6 +514,45 @@ ts_export! {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub duration_ms: Option<u64>,
         pub ts: u64,
+        /// The item belongs to the thread of this sub-agent (`Subagent::id`), not to the chat
+        /// itself: it is only shown in the sub-agent's read-only view. Snapshots and
+        /// `chat_older` carry the chat's own items only; `chat_thread` reads a sub-agent's.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub thread: Option<String>,
+        /// `kind == subagent`: the sub-agent this card stands for. `text` is its task (prompt).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub subagent: Option<Subagent>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum SubagentStatus {
+        Running,
+        /// Finished its task (the parent may give it more work later).
+        Done,
+        Failed,
+        Interrupted,
+        /// Closed by the parent agent.
+        Closed,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct Subagent {
+        /// Id of the sub-agent's thread (Codex thread id, Claude Code Task tool-use id); the
+        /// `thread` of its items and approvals. Empty until the agent has been created.
+        pub id: String,
+        /// Display name: Codex nickname, Claude Code task description.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub name: Option<String>,
+        /// Agent type / role: Codex agent role, Claude Code `subagent_type`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub role: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub model: Option<String>,
+        pub status: SubagentStatus,
+        /// Its final reply, once there is one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub reply: Option<String>,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -530,6 +601,12 @@ ts_export! {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub item: Option<String>,
         pub ts: u64,
+        /// Raised inside this sub-agent (`Subagent::id`); answered like any other approval.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub thread: Option<String>,
+        /// Display name of that sub-agent (`Subagent::name`), when known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub thread_name: Option<String>,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -753,6 +830,8 @@ impl ChatItem {
             exit_code: None,
             duration_ms: None,
             ts,
+            thread: None,
+            subagent: None,
         }
     }
 }

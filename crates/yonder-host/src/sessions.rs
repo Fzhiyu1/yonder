@@ -380,7 +380,7 @@ impl Sessions {
     pub fn list(&self) -> Vec<SessionInfo> {
         let g = self.inner.lock().unwrap();
         let mut v: Vec<SessionInfo> = g.values().map(|s| s.info()).collect();
-        v.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        v.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
         v
     }
 
@@ -446,7 +446,7 @@ impl Sessions {
                 s.preview = terminal_preview(&s.dir);
             }
             SessionKind::Chat => {
-                let st = ChatState::load(&s.dir);
+                let st = ChatState::load(&s.dir).without_threads();
                 s.offset = st.seq;
                 s.chat_status = Some(ChatStatus::Exited);
                 s.preview = st.preview();
@@ -872,7 +872,7 @@ impl Sessions {
                         tracing::debug!(session = %id, "chat supervisor: {message}");
                     }
                 }
-                ChatSupEvent::Info { .. } => {}
+                ChatSupEvent::Info { .. } | ChatSupEvent::Thread { .. } => {}
             }
         }
         Ok(())
@@ -892,7 +892,7 @@ impl Sessions {
             }
             s.offset = seq;
             s.updated_at = now_ms();
-            let st = s.chat.get_or_insert_with(ChatState::default);
+            let st = s.chat.get_or_insert_with(|| ChatState::default().without_threads());
             let before_status = st.status;
             st.apply(seq, &ev);
             let preview = st.preview();
@@ -926,10 +926,16 @@ impl Sessions {
                         .clone()
                         .or_else(|| approval.reason.clone())
                         .unwrap_or_else(|| approval.title.clone());
+                    // Raised by a sub-agent: say which one.
+                    let who = match (&approval.thread, &approval.thread_name) {
+                        (Some(_), Some(n)) => format!("子智能体 {n} · "),
+                        (Some(_), None) => "子智能体 · ".to_string(),
+                        _ => String::new(),
+                    };
                     signal = Some(SessionSignal::Approval {
                         session: id.to_string(),
                         title: s.meta.title.clone(),
-                        body: format!("{} · {}", approval.title, one_line(&body, 300)),
+                        body: format!("{who}{} · {}", approval.title, one_line(&body, 300)),
                     });
                 }
                 _ => {}
@@ -1159,7 +1165,7 @@ impl Sessions {
             return ChatSnapshot { items: vec![], approvals: vec![], status: ChatStatus::Exited, seq: 0, truncated: false };
         };
         if s.chat.is_none() {
-            s.chat = Some(ChatState::load(&s.dir));
+            s.chat = Some(ChatState::load(&s.dir).without_threads());
         }
         let st = s.chat.as_ref().unwrap();
         // Only the newest page: long chats used to send megabytes before showing anything.
@@ -1183,7 +1189,7 @@ impl Sessions {
                 return Err(ApiError::invalid("not a chat session"));
             }
             if s.chat.is_none() {
-                s.chat = Some(ChatState::load(&s.dir));
+                s.chat = Some(ChatState::load(&s.dir).without_threads());
             }
             if let Some(r) = s.chat.as_ref().unwrap().older(before, limit) {
                 return Ok(r);
@@ -1196,6 +1202,41 @@ impl Sessions {
             // Older than what the log keeps in memory.
             None => Ok((Vec::new(), false)),
         }
+    }
+
+    /// A page of a sub-agent's thread, oldest first, plus whether older items exist and the
+    /// seq it reflects. The supervisor of a running chat has every thread; the daemon's own
+    /// copy starts at a snapshot that carries none, so ended chats are read from the log.
+    pub async fn chat_thread(&self, id: &str, thread: &str, before: Option<&str>, limit: usize) -> Result<(Vec<yonder_proto::app::ChatItem>, bool, u64), ApiError> {
+        let (dir, live) = {
+            let g = self.inner.lock().unwrap();
+            let s = g.get(id).ok_or_else(|| ApiError::not_found(format!("session {id}")))?;
+            if s.meta.kind != SessionKind::Chat {
+                return Err(ApiError::invalid("not a chat session"));
+            }
+            (s.dir.clone(), s.live())
+        };
+        if live {
+            let asked = async {
+                let c = ChatClient::connect(&dir, id).await?;
+                c.thread(thread, before, limit).await
+            };
+            match tokio::time::timeout(Duration::from_secs(10), asked).await {
+                Ok(Ok(r)) => return Ok(r),
+                Ok(Err(e)) => tracing::debug!(session = %id, "chat thread from supervisor: {e:#}"),
+                Err(_) => tracing::debug!(session = %id, "chat thread from supervisor timed out"),
+            }
+        }
+        let dir2 = dir.clone();
+        let thread = thread.to_string();
+        let before = before.map(str::to_string);
+        tokio::task::spawn_blocking(move || {
+            let st = ChatState::load(&dir2);
+            let (items, more) = st.thread_page(&thread, before.as_deref(), limit);
+            (items, more, st.seq)
+        })
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))
     }
 
     // ---------------------------------------------------------------- commands

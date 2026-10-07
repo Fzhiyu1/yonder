@@ -87,6 +87,14 @@ pub enum ChatReq {
     SetApproval { mode: ApprovalMode },
     /// Switch the agent's model.
     SetModel { model: String },
+    /// A page of a sub-agent's thread (answered with `thread`). Supervisors of older releases
+    /// close the connection instead.
+    Thread {
+        thread: String,
+        #[serde(default)]
+        before: Option<String>,
+        limit: usize,
+    },
     /// Stop the agent (the supervisor lingers afterwards).
     Kill,
     /// Stop the agent and the supervisor now.
@@ -129,6 +137,8 @@ pub enum ChatSupEvent {
     Meta { meta: ChatMeta },
     /// The request could not be carried out (e.g. the agent already exited).
     Error { message: String },
+    /// Answer to `thread`.
+    Thread { items: Vec<yonder_proto::app::ChatItem>, more: bool, seq: u64 },
 }
 
 /// Events kept in memory for incremental catch-up.
@@ -273,7 +283,7 @@ async fn run(args: ChatSupArgs) -> Result<()> {
                         let Some(ev) = ev else { break };
                         match ev {
                             AdapterEvent::Item(item) => shared.push(ChatEv::Item { item }),
-                            AdapterEvent::Delta { item, field, delta } => shared.push(ChatEv::Delta { item, field, delta }),
+                            AdapterEvent::Delta { item, field, delta, thread } => shared.push(ChatEv::Delta { item, field, delta, thread }),
                             AdapterEvent::Status { status, detail } => shared.push(ChatEv::Status { status, detail }),
                             AdapterEvent::ApprovalRequested(approval) => {
                                 shared.push(ChatEv::ApprovalRequested { approval });
@@ -440,6 +450,14 @@ async fn serve_conn(shared: Arc<Shared>, conn: Stream) -> Result<()> {
                     let _ = shared.cmds.send(AdapterCmd::SetModel(model)).await;
                 }
             }
+            ChatReq::Thread { thread, before, limit } => {
+                let ev = {
+                    let g = shared.st.lock().unwrap();
+                    let (items, more) = g.state.thread_page(&thread, before.as_deref(), limit);
+                    ChatSupEvent::Thread { items, more, seq: g.state.seq }
+                };
+                let _ = out_tx.send(ev).await;
+            }
             ChatReq::Kill => {
                 let _ = shared.cmds.send(AdapterCmd::Shutdown).await;
             }
@@ -499,6 +517,18 @@ impl ChatClient {
     pub async fn recv(&self) -> Result<Option<ChatSupEvent>> {
         let mut rx = self.rx.lock().await;
         Ok(read_frame(&mut *rx).await?)
+    }
+
+    /// A page of a sub-agent's thread from the supervisor (one request per connection).
+    pub async fn thread(&self, thread: &str, before: Option<&str>, limit: usize) -> Result<(Vec<yonder_proto::app::ChatItem>, bool, u64)> {
+        self.send(&ChatReq::Thread { thread: thread.to_string(), before: before.map(str::to_string), limit }).await?;
+        loop {
+            match self.recv().await? {
+                Some(ChatSupEvent::Thread { items, more, seq }) => return Ok((items, more, seq)),
+                Some(_) => continue,
+                None => anyhow::bail!("chat supervisor closed"),
+            }
+        }
     }
 
     pub async fn info(&self) -> Result<ChatSupInfo> {

@@ -123,7 +123,7 @@ fn is_not_installed(e: &anyhow::Error) -> bool {
 
 /// Filter, sort and page a full listing (pure; unit-tested).
 pub fn filter_page(mut all: Vec<Scanned>, q: &HistoryQuery, errors: Vec<String>) -> HistoryPage {
-    all.sort_by(|a, b| b.summary.updated_at.unwrap_or(0).cmp(&a.summary.updated_at.unwrap_or(0)));
+    all.sort_by_key(|s| std::cmp::Reverse(s.summary.updated_at.unwrap_or(0)));
     if !q.all {
         all.retain(|s| !s.hidden);
     }
@@ -162,7 +162,7 @@ pub fn filter_page(mut all: Vec<Scanned>, q: &HistoryQuery, errors: Vec<String>)
     let mut folders: Vec<HistoryFolder> = Vec::new();
     if offset == 0 {
         let mut f: Vec<(String, (u32, u64))> = counts.into_iter().collect();
-        f.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+        f.sort_by_key(|x| std::cmp::Reverse(x.1 .1));
         folders = f.into_iter().take(60).map(|(path, (count, _))| HistoryFolder { path, count }).collect();
     }
     HistoryPage { sessions, next_cursor: (next < total).then(|| next.to_string()), folders, errors }
@@ -558,7 +558,7 @@ fn newest_jsonl(dirs: &[PathBuf], limit: usize) -> Vec<(PathBuf, u64)> {
         .filter(|p| p.extension().map(|e| e == "jsonl").unwrap_or(false))
         .filter_map(|p| mtime_ms(&p).map(|t| (p, t)))
         .collect();
-    files.sort_by(|a, b| b.1.cmp(&a.1));
+    files.sort_by_key(|f| std::cmp::Reverse(f.1));
     files.truncate(limit);
     files
 }
@@ -649,10 +649,8 @@ pub fn claude_scan(root: &Path) -> Vec<Scanned> {
                         model = v.get("message").and_then(|m| m.get("model")).and_then(|m| m.as_str()).filter(|m| !m.starts_with('<')).map(str::to_string);
                     }
                 }
-                Some("summary") => {
-                    if title.is_none() {
-                        title = v.get("summary").and_then(|s| s.as_str()).map(str::to_string);
-                    }
+                Some("summary") if title.is_none() => {
+                    title = v.get("summary").and_then(|s| s.as_str()).map(str::to_string);
                 }
                 _ => {}
             }

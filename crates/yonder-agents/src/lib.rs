@@ -65,8 +65,8 @@ pub enum AdapterCmd {
 pub enum AdapterEvent {
     /// Insert or replace an item (by id).
     Item(ChatItem),
-    /// Append text to an item field.
-    Delta { item: String, field: DeltaField, delta: String },
+    /// Append text to an item field. `thread`: the item belongs to that sub-agent's thread.
+    Delta { item: String, field: DeltaField, delta: String, thread: Option<String> },
     Status { status: ChatStatus, detail: Option<String> },
     ApprovalRequested(Approval),
     ApprovalResolved { approval: String, option: String },

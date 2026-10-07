@@ -12,10 +12,10 @@ use anyhow::Result;
 use serde_json::{json, Value};
 use yonder_proto::app::{
     AgentKind, Approval, ApprovalKind, ApprovalMode, ApprovalOption, ChatItem, ChatItemKind, ChatStatus, DeltaField,
-    ItemStatus, OptionKind,
+    ItemStatus, OptionKind, SubagentStatus,
 };
 
-use crate::common::{item, now_ms, random_id, strip_ansi, truncate_tail, MAX_OUTPUT};
+use crate::common::{item, now_ms, random_id, set_subagent_status, strip_ansi, subagent_active, subagent_card, truncate_tail, MAX_OUTPUT};
 use crate::driver::{run, Out, Protocol};
 use crate::{AdapterCmd, AdapterEvent, AdapterHandle, AgentLaunch};
 
@@ -99,6 +99,13 @@ pub struct ClaudeState {
     tools: HashMap<String, (String, u64)>,
     approvals: HashMap<String, PendingApproval>,
     model: Option<String>,
+    /// Sub-agent (Task tool) cards by tool-use id, which is also the sub-agent's thread id
+    /// (`parent_tool_use_id` of its messages).
+    cards: HashMap<String, ChatItem>,
+    /// Background sub-agents: their cards stay running after the turn until Claude reports them.
+    background: std::collections::HashSet<String>,
+    /// `agent_id` / `task_id` of a sub-agent -> its tool-use id.
+    tasks: HashMap<String, String>,
     exit_error: Option<String>,
 }
 
@@ -196,8 +203,28 @@ fn structured_patch_diff(path: &str, patch: &[Value]) -> Option<String> {
     Some(out)
 }
 
+/// The tool that runs a sub-agent (`Task`, renamed `Agent` in Claude Code 2.1).
+fn is_task(name: &str) -> bool {
+    matches!(name, "Task" | "Agent")
+}
+
+/// Sub-agent card for a Task tool call (`thread` = its tool-use id).
+fn task_card(id: &str, input: &Value) -> ChatItem {
+    let mut it = subagent_card(id, id, SubagentStatus::Running);
+    it.text = s(input, "prompt");
+    if let Some(sub) = it.subagent.as_mut() {
+        sub.name = s(input, "description").filter(|d| !d.is_empty());
+        sub.role = s(input, "subagent_type").filter(|d| !d.is_empty());
+        sub.model = s(input, "model").filter(|d| !d.is_empty());
+    }
+    it
+}
+
 /// Chat item for a tool_use block built from its (possibly empty) input.
 fn tool_item(id: &str, name: &str, input: &Value, status: ItemStatus) -> ChatItem {
+    if is_task(name) {
+        return task_card(id, input);
+    }
     let kind = tool_kind(name);
     let mut it = item(id, kind, status);
     match kind {
@@ -259,6 +286,9 @@ impl ClaudeState {
             tools: HashMap::new(),
             approvals: HashMap::new(),
             model: None,
+            cards: HashMap::new(),
+            background: Default::default(),
+            tasks: HashMap::new(),
             exit_error: None,
         }
     }
@@ -309,10 +339,19 @@ impl ClaudeState {
         let mut open: Vec<ChatItem> = self.open.drain().map(|(_, v)| v).collect();
         open.sort_by_key(|i| i.ts);
         for mut it in open {
+            if it.kind == ChatItemKind::Subagent {
+                continue;
+            }
             if it.status == ItemStatus::InProgress {
                 it.status = if interrupted { ItemStatus::Declined } else { ItemStatus::Completed };
                 out.event(AdapterEvent::Item(it));
             }
+        }
+        // Foreground sub-agents end with the turn; background ones report later.
+        let ids: Vec<String> = self.cards.iter().filter(|(k, c)| subagent_active(c) && !self.background.contains(*k)).map(|(k, _)| k.clone()).collect();
+        for id in ids {
+            let status = if interrupted { SubagentStatus::Interrupted } else { SubagentStatus::Done };
+            self.update_card(&id, out, |c| c.status = status);
         }
         self.blocks.clear();
         self.tools.clear();
@@ -350,8 +389,7 @@ impl ClaudeState {
                         let it = tool_item(&id, &name, &json!({}), ItemStatus::InProgress);
                         self.tools.insert(id.clone(), (name.clone(), now_ms()));
                         self.blocks.insert(index, Block { item: id.clone(), tool: Some(name), json: String::new() });
-                        self.open.insert(id, it.clone());
-                        out.event(AdapterEvent::Item(it));
+                        self.show_tool(it, out);
                     }
                     _ => {}
                 }
@@ -372,7 +410,7 @@ impl ClaudeState {
                     if let Some(it) = self.open.get_mut(&b.item) {
                         it.text.get_or_insert_with(String::new).push_str(&t);
                     }
-                    out.event(AdapterEvent::Delta { item: b.item.clone(), field: DeltaField::Text, delta: t });
+                    out.event(AdapterEvent::Delta { item: b.item.clone(), field: DeltaField::Text, delta: t, thread: None });
                 }
             }
             "content_block_stop" => {
@@ -388,8 +426,7 @@ impl ClaudeState {
                         // Tool input complete: show it while the tool runs.
                         let input: Value = serde_json::from_str(&b.json).unwrap_or(json!({}));
                         let it = tool_item(&b.item, &name, &input, ItemStatus::InProgress);
-                        self.open.insert(b.item.clone(), it.clone());
-                        out.event(AdapterEvent::Item(it));
+                        self.show_tool(it, out);
                     }
                 }
             }
@@ -400,11 +437,15 @@ impl ClaudeState {
     /// Full assistant message: authoritative content (also covers runs without partials).
     fn on_assistant(&mut self, v: &Value, out: &mut Out) {
         let msg = v.get("message").cloned().unwrap_or(Value::Null);
-        if let Some(m) = s(&msg, "model") {
-            self.set_model(m, out);
-        }
-        if v.get("parent_tool_use_id").map(|p| !p.is_null()).unwrap_or(false) {
-            return; // sub-agent traffic; the Task tool item summarizes it
+        // Messages of a sub-agent carry the tool-use id of its Task call: they belong to its
+        // thread (read-only view), not to the chat.
+        let thread = s(v, "parent_tool_use_id");
+        match (&thread, s(&msg, "model")) {
+            (None, Some(m)) => self.set_model(m, out),
+            (Some(t), Some(m)) => self.update_card(t, out, |c| {
+                c.model.get_or_insert(m);
+            }),
+            _ => {}
         }
         let mid = s(&msg, "id").or_else(|| self.msg.clone()).unwrap_or_else(|| format!("msg-{}", random_id()));
         for (i, c) in msg.get("content").and_then(|c| c.as_array()).into_iter().flatten().enumerate() {
@@ -420,29 +461,77 @@ impl ClaudeState {
                     }
                     let mut it = item(&id, if thinking { ChatItemKind::Reasoning } else { ChatItemKind::Agent }, ItemStatus::Completed);
                     it.text = text;
+                    it.thread = thread.clone();
                     out.event(AdapterEvent::Item(it));
                 }
                 Some("tool_use") | Some("server_tool_use") => {
                     let id = s(c, "id").unwrap_or_else(|| format!("{mid}-{i}"));
                     let name = s(c, "name").unwrap_or_default();
                     let input = c.get("input").cloned().unwrap_or(json!({}));
-                    let it = tool_item(&id, &name, &input, ItemStatus::InProgress);
+                    let mut it = tool_item(&id, &name, &input, ItemStatus::InProgress);
+                    it.thread = thread.clone();
                     self.tools.entry(id.clone()).or_insert((name, now_ms()));
-                    self.open.insert(id, it.clone());
-                    out.event(AdapterEvent::Item(it));
+                    self.show_tool(it, out);
                 }
                 _ => {}
             }
         }
     }
 
+    /// Shows a tool call that is running. Task calls become (or update) sub-agent cards, which
+    /// keep the status they reached.
+    fn show_tool(&mut self, mut it: ChatItem, out: &mut Out) {
+        if it.kind == ChatItemKind::Subagent {
+            // Seen before (streamed, then the full message): keep what is known.
+            if let Some(prev) = self.cards.get(&it.id) {
+                if let (Some(mut sub), Some(new)) = (prev.subagent.clone(), it.subagent.take()) {
+                    sub.name = new.name.or(sub.name);
+                    sub.role = new.role.or(sub.role);
+                    sub.model = new.model.or(sub.model);
+                    it.subagent = Some(sub);
+                }
+                it.status = prev.status;
+                it.text = it.text.or_else(|| prev.text.clone());
+                it.ts = prev.ts;
+            }
+            self.cards.insert(it.id.clone(), it.clone());
+        }
+        self.open.insert(it.id.clone(), it.clone());
+        out.event(AdapterEvent::Item(it));
+    }
+
+    /// Changes the card of sub-agent `id` and sends it when it changed.
+    fn update_card(&mut self, id: &str, out: &mut Out, f: impl FnOnce(&mut yonder_proto::app::Subagent)) {
+        let Some(card) = self.cards.get_mut(id) else { return };
+        let Some(sub) = card.subagent.as_mut() else { return };
+        let before = (sub.clone(), card.status);
+        f(sub);
+        let status = sub.status;
+        set_subagent_status(card, status);
+        if card.subagent.as_ref() != Some(&before.0) || card.status != before.1 {
+            if let Some(o) = self.open.get_mut(id) {
+                *o = card.clone();
+            }
+            out.event(AdapterEvent::Item(card.clone()));
+        }
+    }
+
     /// `user` messages from Claude carry tool results.
     fn on_user(&mut self, v: &Value, out: &mut Out) {
-        if v.get("parent_tool_use_id").map(|p| !p.is_null()).unwrap_or(false) {
-            return;
-        }
+        let thread = s(v, "parent_tool_use_id");
         let content = v.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_array()).cloned().unwrap_or_default();
         let tur = v.get("tool_use_result").cloned();
+        // A sub-agent's task arrives as its first user message: the start of its thread.
+        if let Some(t) = &thread {
+            let text: Vec<String> = content.iter().filter(|c| s(c, "type").as_deref() == Some("text")).filter_map(|c| s(c, "text")).collect();
+            if !text.is_empty() {
+                let id = s(v, "uuid").unwrap_or_else(|| format!("user-{}", random_id()));
+                let mut it = item(id, ChatItemKind::User, ItemStatus::Completed);
+                it.text = Some(text.join("\n"));
+                it.thread = Some(t.clone());
+                out.event(AdapterEvent::Item(it));
+            }
+        }
         for c in content {
             if s(&c, "type").as_deref() != Some("tool_result") {
                 continue;
@@ -455,9 +544,18 @@ impl ClaudeState {
                 _ => String::new(),
             };
             let (name, started) = self.tools.remove(&tid).unwrap_or_else(|| ("tool".into(), now_ms()));
-            let mut it = self.open.remove(&tid).unwrap_or_else(|| tool_item(&tid, &name, &json!({}), ItemStatus::InProgress));
             let rejected = is_error
                 && (text.contains("doesn't want to proceed") || text.contains("was rejected") || text.contains("denied this action"));
+            if self.cards.contains_key(&tid) {
+                self.open.remove(&tid);
+                self.task_result(&tid, &c, tur.as_ref(), is_error, rejected, out);
+                continue;
+            }
+            let mut it = self.open.remove(&tid).unwrap_or_else(|| {
+                let mut it = tool_item(&tid, &name, &json!({}), ItemStatus::InProgress);
+                it.thread = thread.clone();
+                it
+            });
             it.status = if rejected {
                 ItemStatus::Declined
             } else if is_error {
@@ -502,6 +600,46 @@ impl ClaudeState {
         }
     }
 
+    /// The Task tool returned: the sub-agent's final reply, or that it went to the background.
+    fn task_result(&mut self, id: &str, c: &Value, tur: Option<&Value>, is_error: bool, rejected: bool, out: &mut Out) {
+        let launched = tur.and_then(|t| s(t, "status")).is_some_and(|st| st.ends_with("_launched"));
+        if launched {
+            self.background.insert(id.to_string());
+            if let Some(a) = tur.and_then(|t| s(t, "agentId")) {
+                self.tasks.insert(a, id.to_string());
+            }
+            return;
+        }
+        // The reply without Claude's trailer ("agentId: ... <usage>...</usage>").
+        let parts = tur.and_then(|t| t.get("content")).and_then(|c| c.as_array()).cloned().or_else(|| c.get("content").and_then(|c| c.as_array()).cloned());
+        let reply = match (parts, c.get("content")) {
+            (Some(parts), _) => parts.iter().filter_map(|p| s(p, "text")).filter(|t| !t.starts_with("agentId:")).collect::<Vec<_>>().join("\n"),
+            (None, Some(Value::String(t))) => t.clone(),
+            _ => String::new(),
+        };
+        let status = if rejected {
+            SubagentStatus::Interrupted
+        } else if is_error {
+            SubagentStatus::Failed
+        } else {
+            SubagentStatus::Done
+        };
+        // Claude does not stream the sub-agent's last message; it is this result. Close its
+        // thread with it.
+        if !reply.trim().is_empty() {
+            let mut it = item(format!("{id}-reply"), ChatItemKind::Agent, ItemStatus::Completed);
+            it.text = Some(reply.clone());
+            it.thread = Some(id.to_string());
+            out.event(AdapterEvent::Item(it));
+        }
+        self.update_card(id, out, |sub| {
+            sub.status = status;
+            if !reply.trim().is_empty() {
+                sub.reply = Some(truncate_tail(&reply, MAX_OUTPUT));
+            }
+        });
+    }
+
     fn on_control_request(&mut self, v: &Value, out: &mut Out) {
         let request_id = s(v, "request_id").unwrap_or_default();
         let req = v.get("request").cloned().unwrap_or(Value::Null);
@@ -540,6 +678,15 @@ impl ClaudeState {
             _ => Some(serde_json::to_string_pretty(&input).unwrap_or_default()),
         };
         let approval_id = format!("claude-{request_id}");
+        // Raised inside a sub-agent: its tool call is in that sub-agent's thread (or Claude names
+        // the agent).
+        let tool_use = s(&req, "tool_use_id");
+        let thread = tool_use
+            .as_ref()
+            .and_then(|t| self.open.get(t))
+            .and_then(|it| it.thread.clone())
+            .or_else(|| s(&req, "agent_id").and_then(|a| self.tasks.get(&a).cloned()));
+        let thread_name = thread.as_ref().and_then(|t| self.cards.get(t)).and_then(|c| c.subagent.as_ref()).and_then(|sub| sub.name.clone().or_else(|| sub.role.clone()));
         let pending = PendingApproval { request_id, input, suggestions, kind };
         // Switched to full access while Claude still asks (the switch raced this request).
         if self.auto_approves(kind) {
@@ -556,8 +703,10 @@ impl ClaudeState {
             reason,
             detail,
             options,
-            item: s(&req, "tool_use_id"),
+            item: tool_use,
             ts: now_ms(),
+            thread,
+            thread_name,
         };
         self.approvals.insert(approval_id, pending);
         out.event(AdapterEvent::ApprovalRequested(approval));
@@ -686,6 +835,29 @@ impl Protocol for ClaudeState {
                     }
                     if let Some(m) = s(v, "model") {
                         self.set_model(m, &mut out);
+                    }
+                }
+                Some("task_started") => {
+                    if let (Some(task), Some(tool)) = (s(v, "task_id"), s(v, "tool_use_id")) {
+                        self.tasks.insert(task, tool);
+                    }
+                }
+                Some("task_notification") => {
+                    let tool = s(v, "tool_use_id").or_else(|| s(v, "task_id").and_then(|t| self.tasks.get(&t).cloned()));
+                    if let Some(id) = tool {
+                        let status = match s(v, "status").as_deref() {
+                            Some("failed") => SubagentStatus::Failed,
+                            Some("stopped" | "killed") => SubagentStatus::Interrupted,
+                            _ => SubagentStatus::Done,
+                        };
+                        let summary = s(v, "summary").filter(|t| !t.trim().is_empty());
+                        self.background.remove(&id);
+                        self.update_card(&id, &mut out, |sub| {
+                            sub.status = status;
+                            if sub.reply.is_none() {
+                                sub.reply = summary;
+                            }
+                        });
                     }
                 }
                 Some("compact_boundary") => {
@@ -844,7 +1016,7 @@ pub(crate) mod tests {
                     }
                     map.insert(i.id.clone(), i.clone());
                 }
-                AdapterEvent::Delta { item, field, delta } => {
+                AdapterEvent::Delta { item, field, delta, .. } => {
                     if let Some(i) = map.get_mut(item) {
                         match field {
                             DeltaField::Text => i.text.get_or_insert_with(String::new).push_str(delta),
@@ -1047,5 +1219,121 @@ pub(crate) mod tests {
         assert!(out.events.iter().any(|e| matches!(e, AdapterEvent::Item(i) if i.kind == ChatItemKind::System && i.text.as_deref().unwrap_or("").contains("unknown model"))));
         assert!(out.events.iter().any(|e| matches!(e, AdapterEvent::Model(m) if m == "opus")));
         assert_eq!(st.model.as_deref(), Some("opus"));
+    }
+
+    /// Real run (Claude Code 2.1.63): the Agent tool launches one sub-agent; its Bash call asks
+    /// for permission.
+    #[test]
+    fn subagent_card_thread_and_approval_from_recording() {
+        let (st, evs) = replay("claude_subagent_approval.jsonl");
+        let task = "toolu_01E2kwUwr4aBP5rWHFNnC2FP";
+        let items = final_items(&evs);
+        let cards: Vec<&ChatItem> = items.iter().filter(|i| i.kind == ChatItemKind::Subagent).collect();
+        assert_eq!(cards.len(), 1, "{items:?}");
+        let card = cards[0];
+        assert_eq!(card.id, task);
+        assert!(card.thread.is_none());
+        let sub = card.subagent.as_ref().unwrap();
+        assert_eq!(sub.id, task);
+        assert_eq!(sub.name.as_deref(), Some("Run touch command"));
+        assert_eq!(sub.role.as_deref(), Some("general-purpose"));
+        assert_eq!(sub.model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(sub.status, SubagentStatus::Done);
+        assert_eq!(sub.reply.as_deref(), Some("DONE"));
+        assert_eq!(card.status, ItemStatus::Completed);
+        assert!(card.text.as_deref().unwrap().starts_with("Run the Bash command: touch"));
+        assert!(evs.iter().any(|e| matches!(e, AdapterEvent::Item(i) if i.id == task && i.status == ItemStatus::InProgress)));
+
+        // Its task, its Bash call and the result are in its thread.
+        let thread: Vec<&ChatItem> = items.iter().filter(|i| i.thread.as_deref() == Some(task)).collect();
+        assert!(thread.iter().any(|i| i.kind == ChatItemKind::User && i.text.as_deref().unwrap().contains("touch")), "{thread:?}");
+        let bash = thread.iter().find(|i| i.kind == ChatItemKind::Command).expect("sub-agent Bash");
+        assert_eq!(bash.status, ItemStatus::Completed);
+        assert_eq!(bash.exit_code, Some(0));
+        // Claude does not stream the sub-agent's last message: the Task result closes its thread.
+        assert_eq!(thread.last().unwrap().kind, ChatItemKind::Agent);
+        assert_eq!(thread.last().unwrap().text.as_deref(), Some("DONE"));
+        // The parent's own answer stays in the chat.
+        assert!(items.iter().any(|i| i.thread.is_none() && i.kind == ChatItemKind::Agent && i.text.as_deref() == Some("DONE")));
+
+        let approval = evs
+            .iter()
+            .find_map(|e| match e {
+                AdapterEvent::ApprovalRequested(a) => Some(a.clone()),
+                _ => None,
+            })
+            .expect("sub-agent approval");
+        assert_eq!(approval.thread.as_deref(), Some(task));
+        assert_eq!(approval.thread_name.as_deref(), Some("Run touch command"));
+        assert_eq!(approval.command.as_deref(), Some("touch /tmp/work/cl1/sub_approval.txt"));
+        assert!(st.cards.values().all(|c| !subagent_active(c)));
+    }
+
+    /// Answering the sub-agent's request uses the request id Claude sent.
+    #[test]
+    fn subagent_approval_answer() {
+        let path = format!("{}/tests/fixtures/claude_subagent_approval.jsonl", env!("CARGO_MANIFEST_DIR"));
+        let mut st = ClaudeState::new(launch());
+        st.initialized = true;
+        st.busy = true;
+        let mut approval = None;
+        for line in std::fs::read_to_string(path).unwrap().lines() {
+            let o: Value = serde_json::from_str(line).unwrap();
+            let Some(raw) = o.get("raw").and_then(|r| r.as_str()) else { continue };
+            let v: Value = serde_json::from_str(raw).unwrap();
+            let out = st.on_message(&v);
+            if let Some(a) = out.events.iter().find_map(|e| match e {
+                AdapterEvent::ApprovalRequested(a) => Some(a.clone()),
+                _ => None,
+            }) {
+                approval = Some(a);
+                break;
+            }
+        }
+        let a = approval.unwrap();
+        let out = st.on_cmd(AdapterCmd::Approve { approval_id: a.id.clone(), option_id: "allow".into() });
+        assert_eq!(out.to_agent[0]["response"]["request_id"], "d68e2338-63c8-4f93-8e4f-fcb7b21e9b95");
+        assert_eq!(out.to_agent[0]["response"]["response"]["behavior"], "allow");
+    }
+
+    /// A background sub-agent outlives the turn; Claude's task notification ends its card.
+    #[test]
+    fn background_subagent_until_notification() {
+        let mut st = ClaudeState::new(launch());
+        st.initialized = true;
+        st.busy = true;
+        let task = "toolu_bg";
+        st.on_message(&json!({"type": "assistant", "parent_tool_use_id": null, "message": {"id": "m1", "model": "x", "content": [
+            {"type": "tool_use", "id": task, "name": "Task", "input": {"description": "scan", "subagent_type": "Explore", "prompt": "scan repo", "run_in_background": true}}]}}));
+        st.on_message(&json!({"type": "system", "subtype": "task_started", "task_id": "a1", "tool_use_id": task}));
+        st.on_message(&json!({"type": "user", "parent_tool_use_id": null, "message": {"content": [{"type": "tool_result", "tool_use_id": task, "content": "launched"}]},
+            "tool_use_result": {"status": "async_launched", "agentId": "a1", "prompt": "scan repo"}}));
+        let out = st.on_message(&json!({"type": "result", "subtype": "success", "is_error": false, "session_id": "s"}));
+        assert!(!out.events.iter().any(|e| matches!(e, AdapterEvent::Item(i) if i.id == task)), "still running after the turn");
+        assert!(subagent_active(&st.cards[task]));
+        // Its approval is attributed by agent id.
+        let out = st.on_message(&json!({"type": "control_request", "request_id": "r1", "request": {"subtype": "can_use_tool", "tool_name": "Bash", "input": {"command": "ls"}, "tool_use_id": "toolu_x", "agent_id": "a1"}}));
+        let a = out.events.iter().find_map(|e| match e { AdapterEvent::ApprovalRequested(a) => Some(a.clone()), _ => None }).unwrap();
+        assert_eq!(a.thread.as_deref(), Some(task));
+        assert_eq!(a.thread_name.as_deref(), Some("scan"));
+        let out = st.on_message(&json!({"type": "system", "subtype": "task_notification", "task_id": "a1", "tool_use_id": task, "status": "completed", "summary": "found 3 files"}));
+        let card = out.events.iter().find_map(|e| match e { AdapterEvent::Item(i) => Some(i.clone()), _ => None }).unwrap();
+        let sub = card.subagent.unwrap();
+        assert_eq!(sub.status, SubagentStatus::Done);
+        assert_eq!(sub.reply.as_deref(), Some("found 3 files"));
+    }
+
+    /// Interrupting the turn interrupts its foreground sub-agents.
+    #[test]
+    fn interrupted_turn_interrupts_subagent() {
+        let mut st = ClaudeState::new(launch());
+        st.initialized = true;
+        st.busy = true;
+        st.on_message(&json!({"type": "assistant", "parent_tool_use_id": null, "message": {"id": "m1", "content": [
+            {"type": "tool_use", "id": "toolu_t", "name": "Agent", "input": {"description": "d", "prompt": "p"}}]}}));
+        let out = st.on_message(&json!({"type": "result", "subtype": "error_during_execution", "stop_reason": "tool_use", "is_error": true}));
+        let card = out.events.iter().find_map(|e| match e { AdapterEvent::Item(i) if i.kind == ChatItemKind::Subagent => Some(i.clone()), _ => None }).unwrap();
+        assert_eq!(card.subagent.unwrap().status, SubagentStatus::Interrupted);
+        assert_eq!(card.status, ItemStatus::Declined);
     }
 }

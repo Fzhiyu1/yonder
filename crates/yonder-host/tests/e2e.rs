@@ -14,8 +14,8 @@ use yonder_host::chatlog::{ChatEv, ChatState};
 use yonder_host::control::ControlClient;
 use yonder_host::device::DeviceClient;
 use yonder_proto::app::{
-    AgentKind, ApprovalMode, ChatItemKind, ChatStatus, ClientMsg, Event, Request, Response, SessionKind, SessionSpec,
-    SessionState,
+    AgentKind, ApprovalMode, ChatItemKind, ChatStatus, ClientMsg, Event, ItemStatus, Request, Response, SessionKind, SessionSpec,
+    SessionState, SubagentStatus,
 };
 use yonder_proto::keys::Keypair;
 use yonder_relay::{tls, AppState, Hub, Limits, RelayConfig};
@@ -455,7 +455,85 @@ async fn full_flow_through_relay() {
     let Response::Session { session: cy } = dev.request(Request::CreateSession { spec }).await.unwrap() else { panic!() };
     assert_eq!(cy.approval, Some(ApprovalMode::Ask));
     dev.request(Request::Kill { session: cy.id.clone() }).await.unwrap();
+
+    // ---- sub-agents (fake codex): a card in the chat, its thread on request, its approval here
+    dev.request(Request::SetApprovalMode { session: xid.clone(), mode: ApprovalMode::Ask }).await.unwrap();
+    dev.request(Request::ChatSend { session: xid.clone(), text: "spawn touch sub".into(), attachments: vec![] }).await.unwrap();
+    let card_of = |st: &ChatState| st.items().iter().find(|i| i.kind == ChatItemKind::Subagent).cloned();
+    chat_until(&dev, &mut xchat, &xid, "sub-agent card named", |st| {
+        card_of(st).and_then(|c| c.subagent).is_some_and(|s| s.name.as_deref() == Some("Fakey") && s.status == SubagentStatus::Running)
+    })
+    .await;
+    let card = card_of(&xchat).unwrap();
+    let kid = card.subagent.as_ref().unwrap().id.clone();
+    assert!(card.text.as_deref().unwrap().contains("touch sub"));
+    // Its approval reaches this chat, attributed to it.
+    chat_until(&dev, &mut xchat, &xid, "sub-agent approval", |st| !st.approvals.is_empty()).await;
+    let a = xchat.approvals[0].clone();
+    assert_eq!(a.thread.as_deref(), Some(kid.as_str()));
+    assert_eq!(a.thread_name.as_deref(), Some("Fakey"));
+    // The chat shows none of the sub-agent's own items; its thread has them.
+    assert!(xchat.items().iter().all(|i| i.thread.is_none()));
+    let Response::ChatThread { items, more, seq } =
+        dev.request(Request::ChatThread { session: xid.clone(), thread: kid.clone(), before: None, limit: None }).await.unwrap()
+    else {
+        panic!()
+    };
+    assert!(!more);
+    assert!(seq > 0);
+    assert!(items.iter().all(|i| i.thread.as_deref() == Some(kid.as_str())), "{items:?}");
+    assert!(items.iter().any(|i| i.kind == ChatItemKind::User && i.text.as_deref().unwrap_or("").contains("touch sub")), "{items:?}");
+    assert!(items.iter().any(|i| i.kind == ChatItemKind::Command && i.status == ItemStatus::InProgress), "{items:?}");
+    // Live items of the thread stream to attached clients with `thread` set.
+    let allow = a.options.iter().find(|o| o.id == "allow").unwrap().id.clone();
+    dev.request(Request::ApprovalRespond { session: xid.clone(), approval: a.id.clone(), option: allow }).await.unwrap();
+    let live = dev
+        .wait_event(Duration::from_secs(20), |ev| {
+            // Keep the chat view in step while looking for the delta.
+            if let Some((s, seq, ch)) = ChatEv::from_event(ev) {
+                if s == xid && seq > xchat.seq {
+                    assert_eq!(seq, xchat.seq + 1, "chat seq gap");
+                    xchat.apply(seq, &ch);
+                }
+            }
+            match ev {
+                Event::ChatDelta { session, thread: Some(t), delta, .. } if *session == xid && *t == kid => Some(delta.clone()),
+                _ => None,
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!(live, "DONE");
+    chat_until(&dev, &mut xchat, &xid, "sub-agent closed with its reply", |st| {
+        st.approvals.is_empty()
+            && card_of(st).and_then(|c| c.subagent).is_some_and(|s| s.status == SubagentStatus::Closed && s.reply.as_deref() == Some("DONE"))
+            && agent_texts(st).iter().any(|t| t.starts_with("sub-agent said DONE"))
+    })
+    .await;
+    assert_eq!(xchat.items().iter().filter(|i| i.kind == ChatItemKind::Subagent).count(), 1);
+    let Response::ChatThread { items, .. } =
+        dev.request(Request::ChatThread { session: xid.clone(), thread: kid.clone(), before: None, limit: Some(50) }).await.unwrap()
+    else {
+        panic!()
+    };
+    assert!(items.iter().any(|i| i.kind == ChatItemKind::Command && i.status == ItemStatus::Completed), "{items:?}");
+    assert!(items.iter().any(|i| i.kind == ChatItemKind::Agent && i.text.as_deref() == Some("DONE")), "{items:?}");
+    // Unknown thread: empty, not an error.
+    let Response::ChatThread { items, .. } =
+        dev.request(Request::ChatThread { session: xid.clone(), thread: "nope".into(), before: None, limit: None }).await.unwrap()
+    else {
+        panic!()
+    };
+    assert!(items.is_empty());
     dev.request(Request::Kill { session: xid.clone() }).await.unwrap();
+    // After the chat ended the thread is read from the log.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let Response::ChatThread { items, .. } =
+        dev.request(Request::ChatThread { session: xid.clone(), thread: kid.clone(), before: None, limit: None }).await.unwrap()
+    else {
+        panic!()
+    };
+    assert!(items.iter().any(|i| i.kind == ChatItemKind::Agent && i.text.as_deref() == Some("DONE")), "{items:?}");
 
     // ---- files
     let root = dunce_canon(&env.work);
