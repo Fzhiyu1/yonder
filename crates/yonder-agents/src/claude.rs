@@ -825,6 +825,9 @@ impl Protocol for ClaudeState {
                     let id = format!("claude-{rid}");
                     if self.approvals.remove(&id).is_some() {
                         out.event(AdapterEvent::ApprovalResolved { approval: id, option: "cancelled".into() });
+                        if self.approvals.is_empty() {
+                            out.status(if self.busy { ChatStatus::Working } else { ChatStatus::Idle }, None);
+                        }
                     }
                 }
             }
@@ -1112,6 +1115,30 @@ pub(crate) mod tests {
         assert!(out.events.iter().any(|e| matches!(e, AdapterEvent::Status { status: ChatStatus::AwaitingApproval, .. })));
 
         let out = st.on_cmd(AdapterCmd::Approve { approval_id: approval.id, option_id: "allow".into() });
+        assert!(out.events.iter().any(|e| matches!(e, AdapterEvent::Status { status: ChatStatus::Idle, detail: None })));
+    }
+
+    #[test]
+    fn cancelled_background_approval_returns_to_idle_after_parent_turn() {
+        let mut st = ClaudeState::new(launch());
+        st.initialized = true;
+        st.busy = false;
+        let out = st.on_message(&json!({
+            "type": "control_request",
+            "request_id": "child-cancel",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "Bash",
+                "input": {"command": "ls"},
+                "tool_use_id": "child-tool"
+            }
+        }));
+        assert!(out.events.iter().any(|e| matches!(e, AdapterEvent::Status { status: ChatStatus::AwaitingApproval, .. })));
+
+        let out = st.on_message(&json!({
+            "type": "control_cancel_request",
+            "request_id": "child-cancel"
+        }));
         assert!(out.events.iter().any(|e| matches!(e, AdapterEvent::Status { status: ChatStatus::Idle, detail: None })));
     }
 
