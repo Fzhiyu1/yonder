@@ -498,6 +498,9 @@ try {
     const before = await rows();
     note(`collapsed: ${before} rows, toggle "${(await more.innerText()).trim()}", pinned collapse ${(await pinned.count()) ? 'shown' : 'hidden'}`);
     check(before === 12 && !(await pinned.count()), 'sidebar-list: collapsed list is not 12 rows');
+    const toggleH = (await more.boundingBox())?.height ?? 0;
+    note(`list toggle height: ${Math.round(toggleH)}px`);
+    check(toggleH >= MIN - 0.5, 'sidebar-list: list toggle below the touch minimum');
     await audit(page, 's1-sidebar-collapsed');
 
     await tap(more);
@@ -513,8 +516,12 @@ try {
     check(await reachable(pinned), 'sidebar-list: pinned collapse not reachable');
     await audit(page, 's2-sidebar-expanded-scrolled');
 
-    await tap(pinned);
+    await pinned.focus();
+    await page.keyboard.press('Enter');
     await page.waitForTimeout(300);
+    const focusOnToggle = await page.evaluate(() => document.activeElement?.textContent?.trim().startsWith('显示全部') ?? false);
+    note(`focus after pinned collapse: ${focusOnToggle ? 'list toggle' : 'lost'}`);
+    check(focusOnToggle, 'sidebar-list: pinned collapse dropped keyboard focus');
     const afterPinned = await rows();
     const topPinned = await headerAtTop();
     note(`pinned collapse: ${afterPinned} rows, host header ${topPinned ? 'in view' : 'scrolled away'}`);

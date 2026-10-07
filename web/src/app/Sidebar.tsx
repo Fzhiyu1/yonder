@@ -72,7 +72,10 @@ function HostGroup({ h, rt, route, now }: { h: StoredHost; rt?: HostRuntime; rou
   const infoActive = route.name === 'host' && route.host === h.host;
   const historyActive = route.name === 'history' && route.host === h.host;
   const section = useRef<HTMLElement>(null);
+  const toggle = useRef<HTMLButtonElement>(null);
   const collapse = () => {
+    // The pinned collapse button unmounts; keep keyboard focus on this host's list toggle.
+    const refocus = document.activeElement instanceof HTMLElement && document.activeElement.closest('[data-pinned-collapse]');
     setShowAll(false);
     // Back to the top of this host when its header scrolled away with the long list. Only the
     // sidebar scrolls: scrollIntoView could also move the page on iOS.
@@ -82,6 +85,7 @@ function HostGroup({ h, rt, route, now }: { h: StoredHost; rt?: HostRuntime; rou
       if (!el || !nav) return;
       const off = el.getBoundingClientRect().top - nav.getBoundingClientRect().top;
       if (off < 0) nav.scrollTop += off;
+      if (refocus) toggle.current?.focus({ preventScroll: true });
     });
   };
   const tool = 'flex h-8 min-w-0 flex-1 items-center justify-center gap-1.5 rounded-md px-2 text-[13px] text-muted hover:bg-hover hover:text-fg disabled:opacity-40 max-md:h-11';
@@ -103,7 +107,7 @@ function HostGroup({ h, rt, route, now }: { h: StoredHost; rt?: HostRuntime; rou
             <OsIcon os={os} size={12} className="shrink-0 text-faint" />
           </button>
           {open && expanded && (
-            <IconButton label="收起会话列表" size="sm" onClick={collapse}>
+            <IconButton label="收起会话列表" size="sm" data-pinned-collapse onClick={collapse}>
               <ChevronsDownUp size={15} />
             </IconButton>
           )}
@@ -153,10 +157,11 @@ function HostGroup({ h, rt, route, now }: { h: StoredHost; rt?: HostRuntime; rou
           ))}
           {long && (
             <button
+              ref={toggle}
               type="button"
               aria-expanded={expanded}
               onClick={() => (expanded ? collapse() : setShowAll(true))}
-              className="flex items-center gap-1.5 rounded-md px-2 py-1 text-left text-[12.5px] text-muted hover:bg-hover max-md:py-2.5"
+              className="flex items-center gap-1.5 rounded-md px-2 py-1 text-left text-[12.5px] text-muted hover:bg-hover max-md:min-h-11 max-md:py-2.5"
             >
               {expanded ? <ChevronsDownUp size={13} /> : <ChevronsUpDown size={13} />}
               {expanded ? '收起' : `显示全部 ${sessions.length} 个`}
