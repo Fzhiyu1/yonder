@@ -175,7 +175,9 @@ await ctx.addInitScript(() => {
 });
 const page = await ctx.newPage();
 page.on('pageerror', (e) => report.errors.push(String(e)));
-page.on('console', (m) => m.type() === 'error' && report.errors.push(m.text()));
+// WebKit builds without `interactive-widget` support report the viewport meta key as an error.
+const BENIGN = [/Viewport argument key "interactive-widget" not recognized/];
+page.on('console', (m) => m.type() === 'error' && !BENIGN.some((re) => re.test(m.text())) && report.errors.push(m.text()));
 // A fresh document per flow (a hash-only goto would keep the mock state of the last flow).
 const go = async (hash) => {
   await page.goto('about:blank');
@@ -467,6 +469,76 @@ try {
     await page.waitForSelector('text=部署中继到 relay-1');
     note(`chip: ${(await page.getByRole('button', { name: /^审批模式/ }).getAttribute('aria-label').catch(() => 'missing')) ?? 'missing'}`);
     await audit(page, 'h1-claude-yolo');
+  }
+
+  // S. Long session list: expand, scroll with the host tools pinned, collapse both ways.
+  await page.goto('about:blank');
+  await page.goto(`${base}/?mock=1&sessions=30#/`);
+  await page.waitForSelector('text=修复锁屏后中继连接假在线');
+  await page.waitForTimeout(400);
+  {
+    const { tap, note } = flow('sidebar-list');
+    const nav = page.locator('aside nav');
+    const group = nav.locator('section').first();
+    const rows = () => group.locator('button[data-session]').count();
+    const more = group.getByRole('button', { name: /^显示全部/ });
+    const pinned = group.getByRole('button', { name: '收起会话列表' });
+    // A control counts as reachable only when it is inside the sidebar band and on top.
+    const reachable = (loc) =>
+      loc.evaluate((el) => {
+        const b = el.getBoundingClientRect();
+        const n = el.closest('nav').getBoundingClientRect();
+        if (b.top < n.top - 0.5 || b.bottom > n.bottom + 0.5) return false;
+        const hit = document.elementFromPoint(b.left + b.width / 2, b.top + b.height / 2);
+        return !!hit && el.contains(hit);
+      });
+    const tools = ['历史', '文件', '主机信息'].map((t) => group.getByRole('button', { name: t, exact: true }));
+    const headerAtTop = () => group.evaluate((el) => el.getBoundingClientRect().top >= el.closest('nav').getBoundingClientRect().top - 0.5);
+
+    const before = await rows();
+    note(`collapsed: ${before} rows, toggle "${(await more.innerText()).trim()}", pinned collapse ${(await pinned.count()) ? 'shown' : 'hidden'}`);
+    check(before === 12 && !(await pinned.count()), 'sidebar-list: collapsed list is not 12 rows');
+    await audit(page, 's1-sidebar-collapsed');
+
+    await tap(more);
+    await page.waitForTimeout(200);
+    const all = await rows();
+    note(`expanded: ${all} rows`);
+    check(all === 30, 'sidebar-list: show all did not list every session');
+    await nav.evaluate((el) => (el.scrollTop = el.scrollHeight / 2));
+    await page.waitForTimeout(200);
+    const toolsOk = await Promise.all(tools.map(reachable));
+    note(`scrolled ${await nav.evaluate((el) => el.scrollTop)}px: tools ${toolsOk.map((ok) => (ok ? 'reachable' : 'hidden')).join('/')}, pinned collapse ${(await reachable(pinned)) ? 'reachable' : 'hidden'}`);
+    check(toolsOk.every(Boolean), 'sidebar-list: host tools not reachable while the list is scrolled');
+    check(await reachable(pinned), 'sidebar-list: pinned collapse not reachable');
+    await audit(page, 's2-sidebar-expanded-scrolled');
+
+    await tap(pinned);
+    await page.waitForTimeout(300);
+    const afterPinned = await rows();
+    const topPinned = await headerAtTop();
+    note(`pinned collapse: ${afterPinned} rows, host header ${topPinned ? 'in view' : 'scrolled away'}`);
+    check(afterPinned === 12 && topPinned, 'sidebar-list: pinned collapse did not restore the list');
+    await audit(page, 's3-sidebar-after-collapse');
+
+    // The toggle at the end of the list collapses too.
+    await tap(more);
+    await page.waitForTimeout(200);
+    const less = group.getByRole('button', { name: '收起', exact: true });
+    await tap(less);
+    await page.waitForTimeout(300);
+    const afterLess = await rows();
+    const topLess = await headerAtTop();
+    note(`bottom collapse: ${afterLess} rows, host header ${topLess ? 'in view' : 'scrolled away'}`);
+    check(afterLess === 12 && topLess, 'sidebar-list: bottom collapse did not restore the list');
+
+    // A pinned tool still navigates while the list is long and scrolled.
+    await tap(more);
+    await nav.evaluate((el) => (el.scrollTop = el.scrollHeight / 2));
+    await tap(tools[0]);
+    await page.waitForTimeout(400);
+    note(`history tap: ${page.url().split('#')[1]}`);
+    check(page.url().endsWith(`#/h/${MAC}/history`), 'sidebar-list: pinned history button did not navigate');
   }
 } catch (err) {
   report.errors.push(`probe: ${err.stack ?? err}`);

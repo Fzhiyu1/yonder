@@ -42,6 +42,13 @@ export function isMockMode(): boolean {
   return new URLSearchParams(location.search).get('mock') === '1';
 }
 
+/** `?mock=1&sessions=N` pads the macOS mock host to N sessions (long-list layouts). */
+function mockSessionTarget(): number {
+  if (typeof location === 'undefined') return 0;
+  const n = Number(new URLSearchParams(location.search).get('sessions'));
+  return Number.isFinite(n) ? Math.min(Math.max(0, Math.floor(n)), 500) : 0;
+}
+
 const now = () => Date.now();
 const HOUR = 3_600_000;
 
@@ -788,6 +795,19 @@ class MockHost implements HostConnection {
         ],
         approvals: [], status: 'exited', seq: 88, truncated: true,
       }));
+
+      // Older finished terminals, so the sidebar list can outgrow its preview.
+      for (let i = this.sessions.size; i < mockSessionTarget(); i++) {
+        const id = `s_old_${i}`;
+        const at = t - (30 + i * 7) * HOUR;
+        this.sessions.set(id, {
+          id, kind: 'terminal', agent: 'shell', title: `zsh #${i}`, command: ['/bin/zsh', '-l'], cwd: `${h}/run/tmp`, origin: 'local',
+          state: 'exited', exit_code: 0, created_at: at - HOUR, updated_at: at, cols: 80, rows: 24, clients: 0, pending_approvals: 0, approval_live: false,
+          preview: 'logout',
+        });
+        const out = utf8Encode(`${mockPrompt(`${h}/run/tmp`, 'MacBook')}exit\r\nlogout\r\n`);
+        this.terms.set(id, { out: [out], offset: out.length, line: '', cwd: `${h}/run/tmp` });
+      }
     } else {
       const id = 's_chat_deploy';
       this.sessions.set(id, {
