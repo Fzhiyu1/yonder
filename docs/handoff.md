@@ -130,3 +130,39 @@ whose supervisor predates `set_approval_mode` (needs `OLD_BIN`).
   walk-through: `history-probe.mjs` there.
 - Not verified: the real iPhone; resuming a thread recorded under another provider; a thread
   open in Desktop and yonder at the same time.
+
+## 2026-10-07: development moves to the Linux host
+
+Development continues on the Linux host (checkout `~/run/yonder`, same commit as GitHub
+`main`). The Mac stays a test host and keeps its daemon.
+
+Shipped since 2026-10-05 (all deployed on mac and the Linux host, web on the relay host; the
+Windows host was unreachable and is not updated, see issue #3):
+
+- Artifact viewer (ADR 0003): images, PDFs (pdf.js), HTML files and host-local web pages,
+  tabs, chips under messages, in-chat model switch, folded step groups.
+- Codex idle release (ADR 0004): after 90 s idle the app-server stops so Codex Desktop can
+  continue the same thread; the next send resumes quietly.
+- iOS viewport: the stale `visualViewport.offsetTop` after the keyboard closes no longer
+  shifts the app (`web/src/lib/viewport.ts`).
+- Open host pages in the phone's browser via Tailscale (ADR 0005): `tailnet_url` request,
+  viewer "more" menu (open in browser, copy, share or save).
+- Notifications: a focus report expires after 25 s unless repeated (clients repeat every
+  10 s), so a phone suspended by iOS still gets notified. Notification outcomes are logged.
+- Repository made public: history squashed into one commit, private infrastructure and
+  recorded agent output scrubbed, MIT/Apache-2.0 license files.
+
+Workflow (issue #2, not finished): one issue, one worktree, one branch, one PR; worker agents
+do not deploy; risk tiers low/medium/high decide the evidence needed. See the issues on
+GitHub for the open work (#1 sidebar collapse, #2 workflow, #3 Windows host, #4 iPhone push).
+
+Build and test on the Linux host:
+
+```
+cargo build --workspace && cargo test --workspace
+cd web && pnpm install && pnpm typecheck && pnpm test && pnpm build
+cd web && pnpm e2e webkit mobile   # needs `cargo build -p yonder-cli -p yonder-relay` and web/dist
+```
+
+Deploy commands, host names and addresses are in the maintainer's private notes, not in this
+repository.
