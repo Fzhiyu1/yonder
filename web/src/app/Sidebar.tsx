@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react';
-import { ChevronDown, ChevronRight, FolderOpen, History, Info, Plus, RefreshCw, Settings } from 'lucide-react';
+import { useEffect, useRef, useState } from 'react';
+import { ChevronDown, ChevronRight, ChevronsDownUp, ChevronsUpDown, FolderOpen, History, Info, Plus, RefreshCw, Settings } from 'lucide-react';
 import { relativeTime } from '../lib/format';
 import type { SessionInfo } from '../proto/generated/SessionInfo';
 import { hostLabel, sortedSessions, useHosts, type HostRuntime } from '../store/hosts';
@@ -27,6 +27,7 @@ function SessionRow({ host, s, active, now }: { host: string; s: SessionInfo; ac
   return (
     <button
       type="button"
+      data-session={s.id}
       onClick={() => navigate({ name: 'session', host, session: s.id })}
       className={cx(
         'group flex w-full min-w-0 items-start gap-2.5 rounded-md px-2 py-1.5 text-left transition-colors max-md:py-2.5',
@@ -54,35 +55,92 @@ function SessionRow({ host, s, active, now }: { host: string; s: SessionInfo; ac
   );
 }
 
+/** Sessions listed per host before "show all". */
+const PREVIEW_COUNT = 12;
+
 function HostGroup({ h, rt, route, now }: { h: StoredHost; rt?: HostRuntime; route: Route; now: number }) {
   const [open, setOpen] = useState(true);
   const [showAll, setShowAll] = useState(false);
   const status = rt?.status ?? 'connecting';
   const sessions = sortedSessions(rt);
-  const shown = showAll ? sessions : sessions.slice(0, 12);
+  const long = sessions.length > PREVIEW_COUNT;
+  const expanded = showAll && long;
+  const shown = expanded ? sessions : sessions.slice(0, PREVIEW_COUNT);
   const name = hostLabel(h, rt);
   const os = rt?.info?.os ?? rt?.hello?.os ?? h.os;
   const filesActive = route.name === 'files' && route.host === h.host;
   const infoActive = route.name === 'host' && route.host === h.host;
   const historyActive = route.name === 'history' && route.host === h.host;
+  const section = useRef<HTMLElement>(null);
+  const toggle = useRef<HTMLButtonElement>(null);
+  const collapse = () => {
+    // The pinned collapse button unmounts; keep keyboard focus on this host's list toggle.
+    const refocus = document.activeElement instanceof HTMLElement && document.activeElement.closest('[data-pinned-collapse]');
+    setShowAll(false);
+    // Back to the top of this host when its header scrolled away with the long list. Only the
+    // sidebar scrolls: scrollIntoView could also move the page on iOS.
+    requestAnimationFrame(() => {
+      const el = section.current;
+      const nav = el?.closest('nav');
+      if (!el || !nav) return;
+      const off = el.getBoundingClientRect().top - nav.getBoundingClientRect().top;
+      if (off < 0) nav.scrollTop += off;
+      if (refocus) toggle.current?.focus({ preventScroll: true });
+    });
+  };
+  const tool = 'flex h-8 min-w-0 flex-1 items-center justify-center gap-1.5 rounded-md px-2 text-[13px] text-muted hover:bg-hover hover:text-fg disabled:opacity-40 max-md:h-11';
   return (
-    <section className="mb-2">
-      <div className="group flex h-8 items-center gap-1.5 rounded-md pr-1 pl-1 max-md:h-11">
-        <button
-          type="button"
-          onClick={() => setOpen((o) => !o)}
-          className="flex h-full min-w-0 flex-1 items-center gap-1.5 rounded-md py-1 text-left"
-          aria-expanded={open}
-          title={open ? '折叠' : '展开'}
-        >
-          <span className="text-faint">{open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}</span>
-          <StatusDot status={status} />
-          <span className="min-w-0 truncate text-[13px] font-semibold">{name}</span>
-          <OsIcon os={os} size={12} className="shrink-0 text-faint" />
-        </button>
-        <IconButton label={`在 ${name} 上新建会话`} size="sm" className="opacity-0 group-hover:opacity-100 max-md:opacity-100" onClick={() => useUi.getState().openNewSession({ host: h.host })}>
-          <Plus size={15} />
-        </IconButton>
+    <section ref={section} className="mb-2">
+      {/* Host header and its tools stay on top while its session list scrolls. */}
+      <div className="sticky top-0 z-10 bg-panel pb-1">
+        <div className="group flex h-8 items-center gap-1.5 rounded-md pr-1 pl-1 max-md:h-11">
+          <button
+            type="button"
+            onClick={() => setOpen((o) => !o)}
+            className="flex h-full min-w-0 flex-1 items-center gap-1.5 rounded-md py-1 text-left"
+            aria-expanded={open}
+            title={open ? '折叠' : '展开'}
+          >
+            <span className="text-faint">{open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}</span>
+            <StatusDot status={status} />
+            <span className="min-w-0 truncate text-[13px] font-semibold">{name}</span>
+            <OsIcon os={os} size={12} className="shrink-0 text-faint" />
+          </button>
+          {open && expanded && (
+            <IconButton label="收起会话列表" size="sm" data-pinned-collapse onClick={collapse}>
+              <ChevronsDownUp size={15} />
+            </IconButton>
+          )}
+          <IconButton label={`在 ${name} 上新建会话`} size="sm" className="opacity-0 group-hover:opacity-100 max-md:opacity-100" onClick={() => useUi.getState().openNewSession({ host: h.host })}>
+            <Plus size={15} />
+          </IconButton>
+        </div>
+        {open && (
+          <div className="flex gap-px pl-1">
+            <button
+              type="button"
+              onClick={() => navigate({ name: 'history', host: h.host })}
+              className={cx(tool, historyActive && 'bg-active text-fg')}
+            >
+              <History size={15} className="shrink-0" /> <span className="truncate">历史</span>
+            </button>
+            <button
+              type="button"
+              disabled={status !== 'online'}
+              onClick={() => navigate({ name: 'files', host: h.host })}
+              className={cx(tool, filesActive && 'bg-active text-fg')}
+            >
+              <FolderOpen size={15} className="shrink-0" /> <span className="truncate">文件</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => navigate({ name: 'host', host: h.host })}
+              className={cx(tool, infoActive && 'bg-active text-fg')}
+            >
+              <Info size={15} className="shrink-0" /> <span className="truncate">主机信息</span>
+            </button>
+          </div>
+        )}
       </div>
       {open && (
         <div className="flex flex-col gap-px pl-1">
@@ -97,35 +155,18 @@ function HostGroup({ h, rt, route, now }: { h: StoredHost; rt?: HostRuntime; rou
           {shown.map((s) => (
             <SessionRow key={s.id} host={h.host} s={s} now={now} active={route.name === 'session' && route.host === h.host && route.session === s.id} />
           ))}
-          {sessions.length > shown.length && (
-            <button type="button" onClick={() => setShowAll(true)} className="rounded-md px-2 py-1 text-left text-[12.5px] text-muted hover:bg-hover max-md:py-2.5">
-              显示全部 {sessions.length} 个
+          {long && (
+            <button
+              ref={toggle}
+              type="button"
+              aria-expanded={expanded}
+              onClick={() => (expanded ? collapse() : setShowAll(true))}
+              className="flex items-center gap-1.5 rounded-md px-2 py-1 text-left text-[12.5px] text-muted hover:bg-hover max-md:min-h-11 max-md:py-2.5"
+            >
+              {expanded ? <ChevronsDownUp size={13} /> : <ChevronsUpDown size={13} />}
+              {expanded ? '收起' : `显示全部 ${sessions.length} 个`}
             </button>
           )}
-          <div className="mt-0.5 flex gap-px">
-            <button
-              type="button"
-              onClick={() => navigate({ name: 'history', host: h.host })}
-              className={cx('flex h-8 min-w-0 flex-1 items-center gap-2 rounded-md px-2 text-[13px] text-muted hover:bg-hover hover:text-fg max-md:h-11', historyActive && 'bg-active text-fg')}
-            >
-              <History size={15} className="shrink-0" /> <span className="truncate">历史</span>
-            </button>
-            <button
-              type="button"
-              disabled={status !== 'online'}
-              onClick={() => navigate({ name: 'files', host: h.host })}
-              className={cx('flex h-8 min-w-0 flex-1 items-center gap-2 rounded-md px-2 text-[13px] text-muted hover:bg-hover hover:text-fg disabled:opacity-40 max-md:h-11', filesActive && 'bg-active text-fg')}
-            >
-              <FolderOpen size={15} className="shrink-0" /> <span className="truncate">文件</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => navigate({ name: 'host', host: h.host })}
-              className={cx('flex h-8 min-w-0 flex-1 items-center gap-2 rounded-md px-2 text-[13px] text-muted hover:bg-hover hover:text-fg max-md:h-11', infoActive && 'bg-active text-fg')}
-            >
-              <Info size={15} className="shrink-0" /> <span className="truncate">主机信息</span>
-            </button>
-          </div>
         </div>
       )}
     </section>
