@@ -575,6 +575,39 @@ async function runCombo(engine, form) {
       if (await main().getByText(/unknown variant/).count()) throw new Error('protocol error shown');
     });
 
+    // A sub-agent (fake Codex, chat still in 询问): one card in the chat, its thread read-only and
+    // live, its approval answered from that view, the card ends closed with its reply.
+    await step('chat-subagent', async () => {
+      const box = page.getByLabel('消息', { exact: true });
+      await box.fill('spawn touch sub');
+      await pressSend();
+      const card = main().getByRole('button', { name: '查看子智能体 Fakey' });
+      await card.waitFor({ timeout: 20_000 });
+      await card.getByText('运行中').waitFor({ timeout: 10_000 });
+      await card.click();
+      const panel = page.getByRole('region', { name: '子智能体' });
+      await panel.waitFor({ timeout: 10_000 });
+      await panel.getByText('Run touch sub and reply DONE.').first().waitFor({ timeout: 10_000 });
+      // The approval arrives while the view is open, attributed to the sub-agent.
+      const allow = panel.getByRole('button', { name: '允许', exact: true });
+      await allow.waitFor({ timeout: 20_000 });
+      await panel.getByText('子智能体 Fakey').first().waitFor({ timeout: 5_000 });
+      if (await panel.getByRole('textbox').count()) throw new Error('sub-agent view has an input');
+      await shot('subagent-approval');
+      await allow.click();
+      await panel.getByText('DONE', { exact: true }).first().waitFor({ timeout: 20_000 });
+      await panel.getByText('已关闭').first().waitFor({ timeout: 20_000 });
+      await shot('subagent-thread-done');
+      await panel.getByRole('button', { name: mobile ? '返回对话' : '关闭子智能体' }).click();
+      await main().getByText(/sub-agent said DONE/).first().waitFor({ timeout: 20_000 });
+      await main().getByRole('button', { name: '查看子智能体 Fakey' }).getByText('已关闭').waitFor({ timeout: 10_000 });
+      if ((await main().getByRole('button', { name: /^查看子智能体/ }).count()) !== 1) throw new Error('expected exactly one sub-agent card');
+      // Its own items stay out of the chat: the task shows once (the card's folded line), its
+      // command not at all.
+      if ((await main().getByText('Run touch sub and reply DONE.').count()) > 1) throw new Error('sub-agent task shown outside its card');
+      if (await main().getByText('touch sub', { exact: true }).count()) throw new Error('sub-agent command leaked into the chat');
+    });
+
     // A new chat preselects the mode picked last time for that agent.
     await step('chat-approval-mode-remembered', async () => {
       await toSidebar();

@@ -16,6 +16,8 @@ import { SessionHeader } from '../session/SessionHeader';
 import { ApprovalCard } from './ApprovalCard';
 import { ChatBlockView, UserBubble } from './ChatItems';
 import { Composer } from './Composer';
+import { SubagentPanel } from './SubagentPanel';
+import { useSubagents } from '../../store/subagents';
 
 export function ChatView({ host, s }: { host: string; s: SessionInfo }) {
   const key = chatKey(host, s.id);
@@ -27,6 +29,7 @@ export function ChatView({ host, s }: { host: string; s: SessionInfo }) {
   const info = useHosts((st) => st.runtime[host]?.info);
   const desktop = useIsDesktop();
   const viewerOpen = useViewer((st) => !!st.byChat[key]?.open);
+  const threadOpen = useSubagents((st) => !!st.open[key]);
 
   const open = useCallback((a: Artifact) => useViewer.getState().openArtifact(key, a), [key]);
   const ctx = useMemo<ArtifactCtx>(
@@ -98,7 +101,7 @@ export function ChatView({ host, s }: { host: string; s: SessionInfo }) {
   return (
     <ArtifactContext.Provider value={ctx}>
     <div className="flex h-full min-h-0">
-    <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col" inert={!desktop && viewerOpen}>
+    <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col" inert={!desktop && (viewerOpen || threadOpen)}>
       <SessionHeader host={host} s={s} chatStatus={chat?.status} items={items} />
       <div className="relative min-h-0 flex-1">
         <div ref={scroller} onScroll={onScroll} className="scroll-thin absolute inset-0 overflow-y-auto">
@@ -201,6 +204,7 @@ export function ChatView({ host, s }: { host: string; s: SessionInfo }) {
       </div>
     </div>
     <Viewer host={host} chat={key} />
+    <SubagentPanel host={host} session={s.id} chat={key} exited={exited} />
     </div>
     </ArtifactContext.Provider>
   );

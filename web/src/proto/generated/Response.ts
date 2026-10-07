@@ -33,7 +33,19 @@ items: Array<ChatItem>,
 /**
  * Even older items exist.
  */
-more: boolean, } | { "kind": "http_response", status: number, 
+more: boolean, } | { "kind": "chat_thread", 
+/**
+ * Oldest first.
+ */
+items: Array<ChatItem>, 
+/**
+ * Even older items exist.
+ */
+more: boolean, 
+/**
+ * Seq of the last event reflected in `items`.
+ */
+seq: number, } | { "kind": "http_response", status: number, 
 /**
  * Response headers (lowercase names), e.g. `content-type`.
  */

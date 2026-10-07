@@ -103,4 +103,18 @@ describe('paging', () => {
     // A snapshot that does not line up replaces the view.
     expect(keepOlder(loaded, snap(['x'], true)).order).toEqual(['x']);
   });
+
+  it('keeps sub-agent thread items out of the chat but advances seq', () => {
+    const s0 = base();
+    const r1 = applyChatEvent(s0, { ev: 'chat_item', session: 's', seq: 6, item: item('k1', { thread: 'kid' }) });
+    expect(r1.state.order).toEqual(['a']);
+    expect(r1.state.seq).toBe(6);
+    const r2 = applyChatEvent(r1.state, { ev: 'chat_delta', session: 's', seq: 7, item: 'k2', field: 'text', delta: 'x', thread: 'kid' });
+    expect(r2.state.order).toEqual(['a']);
+    expect(r2.state.seq).toBe(7);
+    const r3 = applyChatEvent(r2.state, { ev: 'chat_item', session: 's', seq: 8, item: item('card', { kind: 'subagent' }) });
+    expect(r3.state.order).toEqual(['a', 'card']);
+    const snap = chatFromSnapshot({ items: [item('x'), item('y', { thread: 'kid' })], approvals: [], status: 'idle', seq: 1, truncated: false });
+    expect(snap.order).toEqual(['x']);
+  });
 });

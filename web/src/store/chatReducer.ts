@@ -36,6 +36,7 @@ export function chatFromSnapshot(s: ChatSnapshot): ChatState {
   const byId: Record<string, ChatItem> = {};
   const order: string[] = [];
   for (const it of s.items) {
+    if (it.thread) continue;
     if (!byId[it.id]) order.push(it.id);
     byId[it.id] = it;
   }
@@ -94,6 +95,8 @@ function upsert(state: ChatState, item: ChatItem): Pick<ChatState, 'order' | 'by
 /**
  * Applies one chat event following the protocol's seq rules:
  * `seq <= current` is ignored, `seq > current + 1` is a gap (re-attach), snapshots replace.
+ * Items of a sub-agent's thread (`thread` set) only advance the seq: they belong to the
+ * sub-agent's read-only view (store/subagents.ts), not to the chat.
  */
 export function applyChatEvent(state: ChatState, event: ChatEvent): ApplyResult {
   if (event.ev === 'chat_snapshot') return { state: keepOlder(state, chatFromSnapshot(event.snapshot)), gap: false };
@@ -101,6 +104,7 @@ export function applyChatEvent(state: ChatState, event: ChatEvent): ApplyResult 
   if (event.seq <= state.seq) return { state, gap: false };
   if (event.seq > state.seq + 1) return { state, gap: true };
   const seq = event.seq;
+  if ((event.ev === 'chat_item' && event.item.thread) || (event.ev === 'chat_delta' && event.thread)) return { state: { ...state, seq }, gap: false };
   switch (event.ev) {
     case 'chat_item':
       return { state: { ...state, ...upsert(state, event.item), seq }, gap: false };

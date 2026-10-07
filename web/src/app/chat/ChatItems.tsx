@@ -2,6 +2,7 @@ import { memo, useState, type ReactNode } from 'react';
 import {
   AlertCircle,
   Ban,
+  Bot,
   Check,
   ChevronDown,
   ChevronRight,
@@ -22,6 +23,7 @@ import { baseName } from '../../lib/paths';
 import { stepsSummary, type ChatBlock } from '../../lib/steps';
 import type { ChatItem } from '../../proto/generated/ChatItem';
 import type { PendingMessage } from '../../store/chat';
+import { useSubagents } from '../../store/subagents';
 import { useArtifactCtx } from '../artifacts/context';
 import { ArtifactChips, ImageThumbs } from '../artifacts/Inline';
 import { artifactFor } from '../../lib/artifacts';
@@ -280,8 +282,94 @@ export function UserBubble({ text, paths, pending, onRetry, onDiscard }: { text:
   );
 }
 
+type SubagentStatus = NonNullable<ChatItem['subagent']>['status'];
+
+export const SUBAGENT_STATUS: Record<SubagentStatus, { label: string; cls: string }> = {
+  running: { label: '运行中', cls: 'text-accent border-accent/40 bg-accent-soft' },
+  done: { label: '已完成', cls: 'text-ok border-ok/40' },
+  failed: { label: '失败', cls: 'text-danger border-danger/40 bg-danger-soft' },
+  interrupted: { label: '已中断', cls: 'text-warn border-warn/40 bg-warn-soft' },
+  closed: { label: '已关闭', cls: 'text-faint border-line-strong' },
+};
+
+export function SubagentStatusPill({ status }: { status: SubagentStatus }) {
+  const st = SUBAGENT_STATUS[status] ?? SUBAGENT_STATUS.running;
+  return (
+    <span className={cx('inline-flex h-6 shrink-0 items-center gap-1 rounded-full border px-2 text-[12px] font-medium whitespace-nowrap', st.cls)}>
+      {status === 'running' && <Spinner size={11} />}
+      {st.label}
+    </span>
+  );
+}
+
+/** Display name of a sub-agent card. */
+export function subagentName(item: ChatItem): string {
+  const sub = item.subagent;
+  return sub?.name || sub?.role || '子智能体';
+}
+
+const firstLine = (t?: string) => (t ?? '').replace(/[*_`#>]/g, '').split('\n').find((l) => l.trim())?.trim();
+
+/** A folded text section of a sub-agent card (task, reply). */
+function CardSection({ label, text }: { label: string; text: string }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="min-w-0">
+      <button
+        type="button"
+        aria-expanded={open}
+        onClick={() => setOpen(!open)}
+        className="flex min-h-8 w-full min-w-0 items-center gap-2 rounded-md px-1 text-left hover:bg-hover max-md:min-h-11"
+      >
+        <span className="shrink-0 text-[12.5px] text-muted">{label}</span>
+        <span className="min-w-0 flex-1 truncate text-[12.5px] text-faint">{open ? '' : firstLine(text)}</span>
+        {open ? <ChevronDown size={13} className="shrink-0 text-faint" /> : <ChevronRight size={13} className="shrink-0 text-faint" />}
+      </button>
+      {open && <Markdown text={text} className="mb-1.5 px-1 text-[13.5px]" />}
+    </div>
+  );
+}
+
+/** One sub-agent spawned by the agent: tap to read its thread. */
+function SubagentCard({ item }: { item: ChatItem }) {
+  const ctx = useArtifactCtx();
+  const sub = item.subagent;
+  const thread = sub?.id;
+  const meta = [sub?.name && sub.role ? sub.role : '', sub?.model ?? ''].filter(Boolean).join(' · ');
+  const canOpen = !!ctx && !!thread;
+  return (
+    <div className="overflow-hidden rounded-lg border border-line bg-panel">
+      <button
+        type="button"
+        disabled={!canOpen}
+        onClick={() => ctx && thread && useSubagents.getState().show(ctx.chat, thread)}
+        aria-label={`查看子智能体 ${subagentName(item)}`}
+        className="flex min-h-11 w-full min-w-0 items-center gap-2.5 px-3 py-1.5 text-left enabled:hover:bg-hover max-md:min-h-12"
+      >
+        <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-accent-soft text-accent">
+          <Bot size={16} />
+        </span>
+        <span className="flex min-w-0 flex-1 flex-col">
+          <span className="truncate text-[14px] font-medium">{subagentName(item)}</span>
+          {meta && <span className="truncate text-[12px] text-faint">{meta}</span>}
+        </span>
+        {sub && <SubagentStatusPill status={sub.status} />}
+        {canOpen && <ChevronRight size={16} className="shrink-0 text-faint" />}
+      </button>
+      {(item.text || sub?.reply) && (
+        <div className="flex flex-col border-t border-line px-2 py-1">
+          {item.text && <CardSection label="任务" text={item.text} />}
+          {sub?.reply && <CardSection label="回复" text={sub.reply} />}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export const ChatItemView = memo(function ChatItemView({ item }: { item: ChatItem }) {
   switch (item.kind) {
+    case 'subagent':
+      return <SubagentCard item={item} />;
     case 'user':
       return <UserBubble text={item.text ?? ''} paths={item.paths} />;
     case 'agent':

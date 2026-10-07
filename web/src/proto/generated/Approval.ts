@@ -14,4 +14,12 @@ detail?: string, options: Array<ApprovalOption>,
 /**
  * Related chat item id.
  */
-item?: string, ts: number, };
+item?: string, ts: number, 
+/**
+ * Raised inside this sub-agent (`Subagent::id`); answered like any other approval.
+ */
+thread?: string, 
+/**
+ * Display name of that sub-agent (`Subagent::name`), when known.
+ */
+thread_name?: string, };

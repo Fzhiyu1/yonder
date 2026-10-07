@@ -103,6 +103,22 @@ export function mockChatItems(now: number): ChatItem[] {
       ts: t(12),
     },
     {
+      id: 'sa1',
+      kind: 'subagent',
+      status: 'completed',
+      text: '读 web/src/net/relay.ts 和 link.ts，找出锁屏恢复后不会触发重连的路径。只读，不要改代码，最后用三句话总结。',
+      paths: [],
+      ts: t(11.5),
+      subagent: {
+        id: MOCK_SUB_THREAD,
+        name: 'Linnaeus',
+        role: 'explorer',
+        model: 'gpt-5.5-mini',
+        status: 'closed',
+        reply: '`RelayLink` 只在 `onclose` 里重连，iOS 挂起后台标签页时不会触发它。\n`visibilitychange` 只刷新了界面，没有检查连接。\n建议回到前台时发一次 ping，10 秒无 pong 就重建连接。',
+      },
+    },
+    {
       id: 'v1',
       kind: 'tool',
       status: 'completed',
@@ -145,6 +161,57 @@ export function mockChatItems(now: number): ChatItem[] {
       ts: t(1),
     },
   ];
+}
+
+/** Thread id of the finished sub-agent in the seeded Codex chat. */
+export const MOCK_SUB_THREAD = '019a4d61-2c3d-7e4f-8a9b-0c1d2e3f4a5b';
+
+/** Its thread (read-only view). */
+export function mockSubagentThread(now: number): ChatItem[] {
+  const t = (m: number) => now - m * 60_000;
+  const th = MOCK_SUB_THREAD;
+  return [
+    { id: 'st1', kind: 'user', status: 'completed', text: '读 web/src/net/relay.ts 和 link.ts，找出锁屏恢复后不会触发重连的路径。只读，不要改代码，最后用三句话总结。', paths: [], ts: t(11.5), thread: th },
+    { id: 'st2', kind: 'reasoning', status: 'completed', text: '先看 RelayLink 的生命周期：连接、ping、onclose，再看页面可见性事件有没有接上。', paths: [], ts: t(11.4), thread: th },
+    { id: 'st3', kind: 'command', status: 'completed', title: 'rg -n "onclose|visibilitychange|ping" web/src/net', output: 'web/src/net/relay.ts:88:    ws.onclose = () => this.scheduleReconnect();\nweb/src/net/relay.ts:131:  private ping?: ReturnType<typeof setInterval>;\nweb/src/net/manager.ts:40:    document.addEventListener(\'visibilitychange\', () => this.refresh());', exit_code: 0, duration_ms: 31, paths: [], ts: t(11.3), thread: th },
+    { id: 'st4', kind: 'command', status: 'completed', title: 'sed -n 120,170p web/src/net/relay.ts', output: '  private ping?: ReturnType<typeof setInterval>;\n  …', exit_code: 0, duration_ms: 9, paths: [], ts: t(11.2), thread: th },
+    { id: 'st5', kind: 'agent', status: 'completed', text: '`RelayLink` 只在 `onclose` 里重连，iOS 挂起后台标签页时不会触发它。\n`visibilitychange` 只刷新了界面，没有检查连接。\n建议回到前台时发一次 ping，10 秒无 pong 就重建连接。', paths: [], ts: t(11), thread: th },
+  ];
+}
+
+/** The running Claude sub-agent on linux-box: card id and thread id are its tool-use id. */
+export const MOCK_SUB_TASK = 'toolu_01Mock7nginxCheck';
+
+export function mockDeploySubagent(now: number): { card: ChatItem; thread: ChatItem[]; approval: Approval } {
+  const t = (m: number) => now - m * 60_000;
+  const th = MOCK_SUB_TASK;
+  const prompt = '检查 /etc/nginx/sites-enabled/relay.conf 是否为 /v1/ws 转发了 Upgrade 和 Connection 头，并确认 proxy_read_timeout 不小于 120 秒。只读。';
+  return {
+    card: { id: th, kind: 'subagent', status: 'in_progress', text: prompt, paths: [], ts: t(7), subagent: { id: th, name: '检查 nginx 反代配置', role: 'Explore', model: 'claude-haiku-4-5', status: 'running' } },
+    thread: [
+      { id: 'yk1', kind: 'user', status: 'completed', text: prompt, paths: [], ts: t(7), thread: th },
+      { id: 'yk0', kind: 'command', status: 'completed', title: 'grep -n "location /v1/ws" -A 8 /etc/nginx/sites-enabled/relay.conf', output: '12:    location /v1/ws {\n13:        proxy_pass http://127.0.0.1:8443;\n14:        proxy_http_version 1.1;\n15:        proxy_set_header Upgrade $http_upgrade;', exit_code: 0, duration_ms: 12, paths: [], ts: t(6.5), thread: th },
+      { id: 'yk2', kind: 'command', status: 'in_progress', title: 'sudo nginx -T', output: '', paths: [], ts: t(6), thread: th },
+    ],
+    approval: {
+      id: 'ap_sub_nginx',
+      kind: 'command',
+      title: '运行命令: sudo nginx -T',
+      command: 'sudo nginx -T',
+      cwd: '/home/me/deploy',
+      reason: '需要读取完整的生效配置（包含 include 的文件）',
+      options: [
+        { id: 'allow', label: '允许', kind: 'allow' },
+        { id: 'allow_always', label: '本会话总是允许', kind: 'allow_always' },
+        { id: 'deny', label: '拒绝', kind: 'deny' },
+        { id: 'abort', label: '拒绝并停止', kind: 'abort' },
+      ],
+      item: 'yk2',
+      ts: t(6),
+      thread: th,
+      thread_name: '检查 nginx 反代配置',
+    },
+  };
 }
 
 export function mockApproval(now: number, id = 'ap1', item = 'c2'): Approval {

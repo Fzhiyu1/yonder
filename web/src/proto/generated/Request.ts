@@ -3,7 +3,15 @@ import type { AgentKind } from "./AgentKind";
 import type { ApprovalMode } from "./ApprovalMode";
 import type { SessionSpec } from "./SessionSpec";
 
-export type Request = { "op": "ping" } | { "op": "host_info" } | { "op": "list_sessions" } | { "op": "create_session", spec: SessionSpec, } | { "op": "attach", session: string, since?: number, } | { "op": "detach", session: string, } | { "op": "chat_older", session: string, before: string, 
+export type Request = { "op": "ping" } | { "op": "host_info" } | { "op": "list_sessions" } | { "op": "create_session", spec: SessionSpec, } | { "op": "attach", session: string, since?: number, } | { "op": "detach", session: string, } | { "op": "chat_thread", session: string, 
+/**
+ * `Subagent::id` of the card.
+ */
+thread: string, before?: string, 
+/**
+ * Page size (default 200, max 500).
+ */
+limit?: number, } | { "op": "chat_older", session: string, before: string, 
 /**
  * Page size (default 40, max 200).
  */
